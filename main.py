@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Query
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -57,6 +57,8 @@ from schemas import (
     TradeRequest,
     TradeResponse,
 )
+from thesis_schemas import ThesisCreate, ThesisResponse, ThesisWithFundamentals
+from thesis_service import close_thesis, create_thesis, get_current_theses, get_current_thesis, get_thesis_history, update_thesis_status
 
 
 @asynccontextmanager
@@ -659,6 +661,144 @@ def list_trades(
     return [TradeRecord.model_validate(trade) for trade in trades]
 
 
+@app.get("/theses", response_model=list[ThesisResponse])
+def list_theses(
+    db: DbSession,
+    status: str | None = Query(default=None, pattern=r"^(active|closed|watching)$"),
+    symbol: str | None = Query(default=None, min_length=1, max_length=16, pattern=r"^[A-Z][A-Z0-9.\-]{0,15}$"),
+) -> list[ThesisResponse]:
+    """Return the current thesis rows, optionally filtered by status or symbol."""
+    try:
+        records = get_current_theses(db, symbols=[symbol] if symbol else None, status=status)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [ThesisResponse.model_validate(record) for record in records]
+
+
+@app.post("/theses", response_model=ThesisResponse)
+def create_thesis_record(payload: ThesisCreate, db: DbSession) -> ThesisResponse:
+    """Create a new thesis version for a symbol."""
+    try:
+        record = create_thesis(
+            db,
+            symbol=payload.symbol,
+            thesis=payload.thesis,
+            catalyst=payload.catalyst,
+            edge=payload.edge,
+            status=payload.status,
+            created_by=payload.created_by,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    return ThesisResponse.model_validate(record)
+
+
+@app.get("/theses/enriched", response_model=list[ThesisWithFundamentals])
+def list_enriched_theses(db: DbSession) -> list[ThesisWithFundamentals]:
+    """Return current active theses with live portfolio weights and stored fundamentals."""
+    try:
+        thesis_rows = get_current_theses(db, status="active")
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    if not thesis_rows:
+        return []
+
+    symbols = [row.symbol for row in thesis_rows]
+    try:
+        fundamentals_map = _load_fundamentals_map(db, symbols)
+        positions = get_alpaca_client().list_positions()
+        summary = get_alpaca_client().get_account_summary()
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    weighted_positions = compute_position_weights(positions, nav=float(summary["nav"]))
+    portfolio_weight_map = {
+        str(position["symbol"]).upper(): float(position["portfolio_weight"])
+        for position in weighted_positions
+    }
+
+    enriched_rows: list[ThesisWithFundamentals] = []
+    for row in thesis_rows:
+        fundamentals = fundamentals_map.get(row.symbol)
+        enriched_rows.append(
+            ThesisWithFundamentals(
+                id=row.id,
+                symbol=row.symbol,
+                version=row.version,
+                thesis=row.thesis,
+                catalyst=row.catalyst,
+                edge=row.edge,
+                status=row.status,
+                created_at=row.created_at,
+                created_by=row.created_by,
+                portfolio_weight=portfolio_weight_map.get(row.symbol, 0.0),
+                trailing_pe=_optional_float(fundamentals.trailing_pe if fundamentals else None),
+                target_mean_price=_optional_float(
+                    fundamentals.target_mean_price if fundamentals else None
+                ),
+                recommendation_key=fundamentals.recommendation_key if fundamentals else None,
+            )
+        )
+
+    return enriched_rows
+
+
+@app.get("/theses/{symbol}/history", response_model=list[ThesisResponse])
+def get_thesis_versions(symbol: str, db: DbSession) -> list[ThesisResponse]:
+    """Return all thesis versions for a symbol in ascending version order."""
+    try:
+        records = get_thesis_history(db, symbol)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [ThesisResponse.model_validate(record) for record in records]
+
+
+@app.get("/theses/{symbol}", response_model=ThesisResponse)
+def get_symbol_thesis(symbol: str, db: DbSession) -> ThesisResponse:
+    """Return the current thesis for a symbol."""
+    try:
+        record = get_current_thesis(db, symbol)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No thesis found for {symbol.upper()}")
+
+    return ThesisResponse.model_validate(record)
+
+
+@app.patch("/theses/{symbol}/status", response_model=ThesisResponse)
+def patch_thesis_status(
+    symbol: str,
+    db: DbSession,
+    status: str = Body(..., embed=True, pattern=r"^(active|closed|watching)$"),
+) -> ThesisResponse:
+    """Update the status of the current thesis version for a symbol."""
+    try:
+        record = update_thesis_status(db, symbol, status)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No thesis found for {symbol.upper()}")
+
+    return ThesisResponse.model_validate(record)
+
+
 @app.post("/trade/execute", response_model=TradeResponse)
 def execute_trade(
     payload: TradeRequest,
@@ -704,6 +844,19 @@ def execute_trade(
         except Exception:
             db.rollback()
             logger.exception("Failed to persist realized P&L rows for sell trade %s", trade.trade_id)
+
+        try:
+            positions = get_alpaca_client().list_positions()
+            open_symbols = {str(position["symbol"]).upper() for position in positions}
+            if payload.ticker.upper() not in open_symbols:
+                close_thesis(db, payload.ticker.upper())
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to auto-close thesis for %s after sell trade %s",
+                payload.ticker.upper(),
+                trade.trade_id,
+            )
 
     response = TradeResponse(
         order_id=order.get("id", ""),

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     inspect,
     text,
@@ -117,6 +118,32 @@ class TickerFundamentals(Base):
     recommendation_mean: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class InvestmentThesis(Base):
+    __tablename__ = "investment_theses"
+    __table_args__ = (
+        UniqueConstraint("symbol", "version", name="uq_investment_theses_symbol_version"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(16),
+        ForeignKey("tickers.symbol"),
+        nullable=False,
+        index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    thesis: Mapped[str] = mapped_column(Text, nullable=False)
+    catalyst: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edge: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False, default="agent")
+
+
 class RealizedPnl(Base):
     __tablename__ = "realized_pnl"
 
@@ -199,6 +226,8 @@ def init_db() -> None:
         RealizedPnl.__table__.create(bind=engine)
     if not inspector.has_table("ticker_fundamentals"):
         TickerFundamentals.__table__.create(bind=engine)
+    if not inspector.has_table("investment_theses"):
+        InvestmentThesis.__table__.create(bind=engine)
     ticker_columns = {column["name"] for column in inspector.get_columns("tickers")}
     if "country" not in ticker_columns:
         with engine.begin() as connection:
