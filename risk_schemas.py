@@ -37,6 +37,7 @@ class RiskMetricsResponse(BaseModel):
     worst_day: ReturnPoint | None
     win_rate: float | None
     current_drawdown: float | None
+    beta_to_spy: float | None = None
     snapshot_count: int
 
 
@@ -55,3 +56,25 @@ class PortfolioRiskReport(BaseModel):
     risk_metrics: RiskMetricsResponse
     sector_exposure: list[ExposureBucket]
     geographic_exposure: list[ExposureBucket]
+
+
+class CorrelationMatrixResponse(BaseModel):
+    symbols: list[str]
+    matrix: list[list[float | None]]
+    lookback_days: int
+    data_points_used: int
+
+
+class StressScenario(BaseModel):
+    scenario: str
+    market_move: float
+    beta_used: float
+    beta_estimated: bool
+    portfolio_move: float
+    dollar_impact: float
+    portfolio_value_after: float
+
+
+class StressTestResponse(BaseModel):
+    current_portfolio_value: float
+    scenarios: list[StressScenario]

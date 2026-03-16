@@ -52,6 +52,15 @@ class DailySnapshot(Base):
     total_drawdown: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
 
+class DailyPrice(Base):
+    __tablename__ = "daily_prices"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    date: Mapped[date] = mapped_column(Date, primary_key=True)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 class Ticker(Base):
     __tablename__ = "tickers"
 
@@ -121,6 +130,8 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
+    if not inspector.has_table("daily_prices"):
+        DailyPrice.__table__.create(bind=engine)
     ticker_columns = {column["name"] for column in inspector.get_columns("tickers")}
     if "country" not in ticker_columns:
         with engine.begin() as connection:

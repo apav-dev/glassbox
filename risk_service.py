@@ -18,6 +18,12 @@ class TickerLike(Protocol):
     country: str | None
 
 
+class PriceLike(Protocol):
+    symbol: str
+    date: date
+    close: float
+
+
 def _to_float(value: Any) -> float:
     return float(value) if value is not None else 0.0
 
@@ -63,6 +69,7 @@ def compute_daily_returns(snapshots: list[SnapshotLike]) -> list[dict[str, Any]]
 def compute_risk_metrics(
     snapshots: list[SnapshotLike],
     risk_free_rate: float = 0.045,
+    benchmark_prices: list[PriceLike] | None = None,
 ) -> dict[str, Any]:
     """Summarize return, volatility, downside risk, and drawdown statistics for the full snapshot history."""
     empty_metrics = {
@@ -80,6 +87,7 @@ def compute_risk_metrics(
         "worst_day": None,
         "win_rate": None,
         "current_drawdown": None,
+        "beta_to_spy": None,
         "snapshot_count": len(snapshots),
     }
     if len(snapshots) < 2:
@@ -154,8 +162,124 @@ def compute_risk_metrics(
         },
         "win_rate": win_rate,
         "current_drawdown": abs(curve[-1]["drawdown"]),
+        "beta_to_spy": compute_portfolio_beta(benchmark_prices or [], snapshots),
         "snapshot_count": len(snapshots),
     }
+
+
+def compute_portfolio_beta(
+    daily_prices: list[PriceLike],
+    portfolio_snapshots: list[SnapshotLike],
+    benchmark_symbol: str = "SPY",
+) -> float | None:
+    benchmark_returns = _build_price_return_map(
+        [
+            price
+            for price in daily_prices
+            if str(getattr(price, "symbol", "")).upper() == benchmark_symbol.upper()
+        ]
+    )
+    portfolio_returns = {
+        point["date"]: point["daily_return"]
+        for point in compute_daily_returns(portfolio_snapshots)[1:]
+    }
+
+    overlapping_dates = sorted(set(benchmark_returns) & set(portfolio_returns))
+    if len(overlapping_dates) < 20:
+        return None
+
+    benchmark_values = [benchmark_returns[day] for day in overlapping_dates]
+    portfolio_values = [portfolio_returns[day] for day in overlapping_dates]
+
+    benchmark_mean = statistics.mean(benchmark_values)
+    portfolio_mean = statistics.mean(portfolio_values)
+    benchmark_variance = statistics.mean(
+        (value - benchmark_mean) ** 2 for value in benchmark_values
+    )
+    if benchmark_variance == 0.0:
+        return None
+
+    covariance = statistics.mean(
+        (portfolio_value - portfolio_mean) * (benchmark_value - benchmark_mean)
+        for portfolio_value, benchmark_value in zip(portfolio_values, benchmark_values, strict=True)
+    )
+    return covariance / benchmark_variance
+
+
+def compute_correlation_matrix(
+    daily_prices: list[PriceLike],
+    symbols: list[str],
+    lookback_days: int = 252,
+) -> dict[str, Any]:
+    normalized_symbols = [symbol.upper() for symbol in symbols]
+    return_maps = {
+        symbol: _build_price_return_map(
+            [price for price in daily_prices if str(getattr(price, "symbol", "")).upper() == symbol],
+            lookback_days=lookback_days,
+        )
+        for symbol in normalized_symbols
+    }
+
+    matrix: list[list[float | None]] = []
+    min_data_points: int | None = None
+    for row_symbol in normalized_symbols:
+        row: list[float | None] = []
+        for column_symbol in normalized_symbols:
+            if row_symbol == column_symbol and return_maps[row_symbol]:
+                overlap_count = len(return_maps[row_symbol])
+                min_data_points = overlap_count if min_data_points is None else min(min_data_points, overlap_count)
+                row.append(1.0)
+                continue
+
+            correlation, overlap_count = _correlation_for_pair(
+                return_maps[row_symbol],
+                return_maps[column_symbol],
+            )
+            if correlation is not None:
+                min_data_points = overlap_count if min_data_points is None else min(min_data_points, overlap_count)
+            row.append(correlation)
+        matrix.append(row)
+
+    return {
+        "symbols": normalized_symbols,
+        "matrix": matrix,
+        "lookback_days": lookback_days,
+        "data_points_used": min_data_points or 0,
+    }
+
+
+def compute_stress_scenarios(
+    portfolio_value: float,
+    beta: float | None,
+    scenarios: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    scenario_set = scenarios or [
+        {"name": "Market Crash", "market_move": -0.20},
+        {"name": "Correction", "market_move": -0.10},
+        {"name": "Flash Crash", "market_move": -0.05},
+        {"name": "Rally", "market_move": 0.10},
+    ]
+    beta_used = beta if beta is not None else 1.0
+    beta_estimated = beta is None
+
+    results: list[dict[str, Any]] = []
+    for scenario in scenario_set:
+        market_move = _to_float(scenario.get("market_move"))
+        portfolio_move = market_move * beta_used
+        dollar_impact = portfolio_value * portfolio_move
+        results.append(
+            {
+                "scenario": str(scenario.get("name", "Scenario")),
+                "market_move": market_move,
+                "beta_used": beta_used,
+                "beta_estimated": beta_estimated,
+                "portfolio_move": portfolio_move,
+                "dollar_impact": dollar_impact,
+                "portfolio_value_after": portfolio_value + dollar_impact,
+            }
+        )
+
+    return results
 
 
 def compute_position_weights(positions: list[dict[str, Any]], nav: float) -> list[dict[str, Any]]:
@@ -223,3 +347,43 @@ def _compute_exposure(
         bucket["weight"] = (bucket["total_market_value"] / nav) if nav else 0.0
 
     return sorted(buckets.values(), key=lambda bucket: bucket["weight"], reverse=True)
+
+
+def _build_price_return_map(
+    prices: list[PriceLike],
+    lookback_days: int | None = None,
+) -> dict[date, float]:
+    ordered_prices = sorted(prices, key=lambda price: price.date)
+    if lookback_days is not None:
+        ordered_prices = ordered_prices[-(lookback_days + 1) :]
+
+    returns: dict[date, float] = {}
+    for previous_price, current_price in zip(ordered_prices, ordered_prices[1:], strict=False):
+        previous_close = _to_float(previous_price.close)
+        current_close = _to_float(current_price.close)
+        if previous_close == 0.0:
+            continue
+        returns[current_price.date] = (current_close - previous_close) / previous_close
+
+    return returns
+
+
+def _correlation_for_pair(
+    left_returns: dict[date, float],
+    right_returns: dict[date, float],
+) -> tuple[float | None, int]:
+    overlapping_dates = sorted(set(left_returns) & set(right_returns))
+    overlap_count = len(overlapping_dates)
+    if overlap_count < 20:
+        return None, overlap_count
+
+    left_values = [left_returns[day] for day in overlapping_dates]
+    right_values = [right_returns[day] for day in overlapping_dates]
+
+    if len(set(left_values)) == 1 or len(set(right_values)) == 1:
+        return None, overlap_count
+
+    try:
+        return statistics.correlation(left_values, right_values), overlap_count
+    except statistics.StatisticsError:
+        return None, overlap_count

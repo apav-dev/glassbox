@@ -1,28 +1,35 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alpaca_client import AlpacaClient
-from models import DailySnapshot, Ticker, Trade, TradeAction, get_db, init_db
+from models import DailyPrice, DailySnapshot, SessionLocal, Ticker, Trade, TradeAction, get_db, init_db
+from price_service import backfill_all_tickers, backfill_ticker_prices
 from risk_schemas import (
+    CorrelationMatrixResponse,
     EquityCurvePoint,
     ExposureBucket,
     PortfolioRiskReport,
     PositionWithWeight,
     RiskMetricsResponse,
+    StressTestResponse,
 )
 from risk_service import (
+    compute_correlation_matrix,
     compute_daily_returns,
     compute_geographic_exposure,
     compute_position_weights,
+    compute_stress_scenarios,
     compute_risk_metrics,
     compute_sector_exposure,
 )
@@ -53,6 +60,7 @@ app = FastAPI(
 )
 
 DbSession = Annotated[Session, Depends(get_db)]
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -93,6 +101,36 @@ def _enrich_positions(
         )
 
     return enriched_positions
+
+
+def _load_price_history(
+    db: Session,
+    symbols: list[str],
+    start_date: date | None = None,
+) -> list[DailyPrice]:
+    if not symbols:
+        return []
+
+    statement = select(DailyPrice).where(DailyPrice.symbol.in_([symbol.upper() for symbol in symbols]))
+    if start_date is not None:
+        statement = statement.where(DailyPrice.date >= start_date)
+
+    return db.scalars(statement.order_by(DailyPrice.symbol.asc(), DailyPrice.date.asc())).all()
+
+
+def _backfill_symbol_prices_in_background(symbol: str) -> None:
+    db = SessionLocal()
+    try:
+        price_exists = db.scalar(
+            select(DailyPrice.symbol).where(DailyPrice.symbol == symbol.upper()).limit(1)
+        )
+        if price_exists is None:
+            backfill_ticker_prices(db, symbol)
+    except Exception:
+        logger.exception("Failed to backfill daily prices for %s after trade execution", symbol.upper())
+        db.rollback()
+    finally:
+        db.close()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -171,10 +209,17 @@ def get_portfolio_risk(
     """Return portfolio-level return and drawdown metrics derived from stored daily snapshots."""
     try:
         snapshots = db.scalars(select(DailySnapshot).order_by(DailySnapshot.date.asc())).all()
+        spy_prices = _load_price_history(db, ["SPY"])
     except SQLAlchemyError as exc:
         raise _database_error(exc) from exc
 
-    return RiskMetricsResponse(**compute_risk_metrics(snapshots, risk_free_rate=risk_free_rate))
+    return RiskMetricsResponse(
+        **compute_risk_metrics(
+            snapshots,
+            risk_free_rate=risk_free_rate,
+            benchmark_prices=spy_prices,
+        )
+    )
 
 
 @app.get("/portfolio/positions/weighted", response_model=list[PositionWithWeight])
@@ -243,6 +288,7 @@ def get_portfolio_risk_report(
     """Return a combined portfolio risk report covering history, sector exposure, and geographic exposure."""
     try:
         snapshots = db.scalars(select(DailySnapshot).order_by(DailySnapshot.date.asc())).all()
+        spy_prices = _load_price_history(db, ["SPY"])
         positions = get_alpaca_client().list_positions()
         summary = get_alpaca_client().get_account_summary()
         ticker_map = _load_ticker_map(
@@ -256,7 +302,13 @@ def get_portfolio_risk_report(
 
     nav = float(summary["nav"])
     return PortfolioRiskReport(
-        risk_metrics=RiskMetricsResponse(**compute_risk_metrics(snapshots, risk_free_rate=risk_free_rate)),
+        risk_metrics=RiskMetricsResponse(
+            **compute_risk_metrics(
+                snapshots,
+                risk_free_rate=risk_free_rate,
+                benchmark_prices=spy_prices,
+            )
+        ),
         sector_exposure=[
             ExposureBucket(**bucket)
             for bucket in compute_sector_exposure(positions, ticker_map, nav=nav)
@@ -265,6 +317,47 @@ def get_portfolio_risk_report(
             ExposureBucket(**bucket)
             for bucket in compute_geographic_exposure(positions, ticker_map, nav=nav)
         ],
+    )
+
+
+@app.get("/portfolio/correlation", response_model=CorrelationMatrixResponse)
+def get_portfolio_correlation(
+    db: DbSession,
+    lookback_days: int = Query(default=252, ge=20, le=2520),
+) -> CorrelationMatrixResponse:
+    """Return a correlation matrix for currently held symbols using local daily close history."""
+    try:
+        positions = get_alpaca_client().list_positions()
+        symbols = sorted({str(position["symbol"]).upper() for position in positions})
+        start_date = datetime.now(timezone.utc).date() - timedelta(days=max(lookback_days * 2, lookback_days + 30))
+        prices = _load_price_history(db, symbols, start_date=start_date)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    return CorrelationMatrixResponse(
+        **compute_correlation_matrix(prices, symbols=symbols, lookback_days=lookback_days)
+    )
+
+
+@app.get("/portfolio/stress-test", response_model=StressTestResponse)
+def get_portfolio_stress_test(db: DbSession) -> StressTestResponse:
+    """Estimate portfolio sensitivity under standard market move scenarios."""
+    try:
+        summary = get_alpaca_client().get_account_summary()
+        snapshots = db.scalars(select(DailySnapshot).order_by(DailySnapshot.date.asc())).all()
+        spy_prices = _load_price_history(db, ["SPY"])
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    portfolio_value = float(summary["nav"])
+    beta = compute_risk_metrics(snapshots, benchmark_prices=spy_prices)["beta_to_spy"]
+    return StressTestResponse(
+        current_portfolio_value=portfolio_value,
+        scenarios=compute_stress_scenarios(portfolio_value=portfolio_value, beta=beta),
     )
 
 
@@ -293,7 +386,11 @@ def list_trades(
 
 
 @app.post("/trade/execute", response_model=TradeResponse)
-def execute_trade(payload: TradeRequest, db: DbSession) -> TradeResponse:
+def execute_trade(
+    payload: TradeRequest,
+    background_tasks: BackgroundTasks,
+    db: DbSession,
+) -> TradeResponse:
     """Submit an Alpaca order and persist the local trade record."""
     try:
         order = get_alpaca_client().submit_order(
@@ -324,7 +421,7 @@ def execute_trade(payload: TradeRequest, db: DbSession) -> TradeResponse:
         db.rollback()
         raise _database_error(exc) from exc
 
-    return TradeResponse(
+    response = TradeResponse(
         order_id=order.get("id", ""),
         client_order_id=order.get("client_order_id", ""),
         status=order.get("status", ""),
@@ -338,6 +435,8 @@ def execute_trade(payload: TradeRequest, db: DbSession) -> TradeResponse:
         strategy_tag=payload.strategy_tag,
         thesis_recorded=True,
     )
+    background_tasks.add_task(_backfill_symbol_prices_in_background, payload.ticker.upper())
+    return response
 
 
 @app.post("/sync", response_model=SyncResponse)
@@ -376,9 +475,13 @@ def sync_portfolio(db: DbSession) -> SyncResponse:
                 new_tickers_added.append(symbol)
 
         db.commit()
+        backfill_all_tickers(db)
     except SQLAlchemyError as exc:
         db.rollback()
         raise _database_error(exc) from exc
+    except Exception as exc:
+        db.rollback()
+        raise _alpaca_error(exc) from exc
 
     return SyncResponse(
         snapshot_date=snapshot_date,

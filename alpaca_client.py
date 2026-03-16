@@ -8,8 +8,10 @@ from typing import Any
 
 try:
     import alpaca_trade_api as tradeapi
+    from alpaca_trade_api.rest import TimeFrame
 except ImportError as exc:  # pragma: no cover - import guard for local dev bootstrapping
     tradeapi = None
+    TimeFrame = None
     _alpaca_import_error = exc
 else:
     _alpaca_import_error = None
@@ -138,6 +140,16 @@ class AlpacaClient:
             timeframe=timeframe,
             extended_hours=extended_hours,
         )
+
+    def get_daily_bars(self, *, symbol: str, start_date: date, end_date: date) -> list[Any]:
+        bars = self.client.get_bars(
+            symbol.upper(),
+            TimeFrame.Day,
+            start=start_date.isoformat(),
+            end=end_date.isoformat(),
+            adjustment="raw",
+        )
+        return list(bars)
 
     def calculate_max_drawdown(self, *, period: str = "1M", timeframe: str = "1D") -> float:
         history = self.get_portfolio_history(period=period, timeframe=timeframe)
