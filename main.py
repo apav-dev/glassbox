@@ -15,7 +15,20 @@ from sqlalchemy.orm import Session
 from alpaca_client import AlpacaClient
 from cost_basis_schemas import CostBasisResponse, RealizedPnlRecord, RealizedPnlSummary, TickerRealizedPnl
 from cost_basis_service import compute_cost_basis, rebuild_realized_pnl, record_realized_pnl_for_trade
-from models import DailyPrice, DailySnapshot, RealizedPnl, SessionLocal, Ticker, Trade, TradeAction, get_db, init_db
+from fundamentals_schemas import FundamentalsRefreshResult, TickerFundamentalsResponse
+from fundamentals_service import get_stale_symbols, refresh_all_fundamentals, refresh_ticker_fundamentals
+from models import (
+    DailyPrice,
+    DailySnapshot,
+    RealizedPnl,
+    SessionLocal,
+    Ticker,
+    TickerFundamentals,
+    Trade,
+    TradeAction,
+    get_db,
+    init_db,
+)
 from price_service import backfill_all_tickers, backfill_ticker_prices
 from risk_schemas import (
     CorrelationMatrixResponse,
@@ -86,19 +99,43 @@ def _load_ticker_map(db: Session, symbols: list[str]) -> dict[str, Ticker]:
     return {ticker.symbol.upper(): ticker for ticker in ticker_rows}
 
 
+def _load_fundamentals_map(db: Session, symbols: list[str]) -> dict[str, TickerFundamentals]:
+    if not symbols:
+        return {}
+
+    rows = db.scalars(select(TickerFundamentals).where(TickerFundamentals.symbol.in_(symbols))).all()
+    return {row.symbol.upper(): row for row in rows}
+
+
 def _enrich_positions(
     positions: list[dict[str, float | str]],
     ticker_map: dict[str, Ticker],
+    fundamentals_map: dict[str, TickerFundamentals],
 ) -> list[dict[str, float | str | None]]:
     enriched_positions: list[dict[str, float | str | None]] = []
     for position in positions:
-        ticker_record = ticker_map.get(str(position["symbol"]).upper())
+        symbol = str(position["symbol"]).upper()
+        ticker_record = ticker_map.get(symbol)
+        fundamentals_record = fundamentals_map.get(symbol)
         enriched_positions.append(
             {
                 **position,
                 "company_name": ticker_record.company_name if ticker_record else None,
                 "sector": ticker_record.sector if ticker_record else None,
                 "industry": ticker_record.industry if ticker_record else None,
+                "trailing_pe": _optional_float(
+                    fundamentals_record.trailing_pe if fundamentals_record else None
+                ),
+                "forward_pe": _optional_float(
+                    fundamentals_record.forward_pe if fundamentals_record else None
+                ),
+                "price_to_book": _optional_float(
+                    fundamentals_record.price_to_book if fundamentals_record else None
+                ),
+                "target_mean_price": _optional_float(
+                    fundamentals_record.target_mean_price if fundamentals_record else None
+                ),
+                "recommendation_key": fundamentals_record.recommendation_key if fundamentals_record else None,
             }
         )
 
@@ -133,6 +170,58 @@ def _backfill_symbol_prices_in_background(symbol: str) -> None:
         db.rollback()
     finally:
         db.close()
+
+
+def _refresh_symbol_fundamentals_in_background(symbol: str) -> None:
+    db = SessionLocal()
+    try:
+        if db.get(TickerFundamentals, symbol.upper()) is None:
+            refresh_ticker_fundamentals(db, symbol)
+    except Exception:
+        logger.exception("Failed to refresh fundamentals for %s after trade execution", symbol.upper())
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _fundamentals_response_from_record(
+    symbol: str,
+    record: TickerFundamentals | None,
+) -> TickerFundamentalsResponse:
+    if record is None:
+        return TickerFundamentalsResponse(symbol=symbol.upper(), updated_at=None)
+
+    return TickerFundamentalsResponse(
+        symbol=record.symbol,
+        updated_at=record.updated_at,
+        market_cap=_optional_float(record.market_cap),
+        trailing_pe=_optional_float(record.trailing_pe),
+        forward_pe=_optional_float(record.forward_pe),
+        price_to_book=_optional_float(record.price_to_book),
+        ev_to_ebitda=_optional_float(record.ev_to_ebitda),
+        ev_to_revenue=_optional_float(record.ev_to_revenue),
+        peg_ratio=_optional_float(record.peg_ratio),
+        price_to_sales=_optional_float(record.price_to_sales),
+        profit_margin=_optional_float(record.profit_margin),
+        gross_margin=_optional_float(record.gross_margin),
+        operating_margin=_optional_float(record.operating_margin),
+        ebitda_margin=_optional_float(record.ebitda_margin),
+        return_on_equity=_optional_float(record.return_on_equity),
+        return_on_assets=_optional_float(record.return_on_assets),
+        target_high_price=_optional_float(record.target_high_price),
+        target_low_price=_optional_float(record.target_low_price),
+        target_mean_price=_optional_float(record.target_mean_price),
+        target_median_price=_optional_float(record.target_median_price),
+        analyst_count=record.analyst_count,
+        recommendation_key=record.recommendation_key,
+        recommendation_mean=_optional_float(record.recommendation_mean),
+    )
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -184,12 +273,17 @@ def list_portfolio_positions(db: DbSession) -> list[PositionResponse]:
     if symbols:
         try:
             ticker_map = _load_ticker_map(db, symbols)
+            fundamentals_map = _load_fundamentals_map(db, symbols)
         except SQLAlchemyError as exc:
             raise _database_error(exc) from exc
     else:
         ticker_map = {}
+        fundamentals_map = {}
 
-    return [PositionResponse(**position) for position in _enrich_positions(positions, ticker_map)]
+    return [
+        PositionResponse(**position)
+        for position in _enrich_positions(positions, ticker_map, fundamentals_map)
+    ]
 
 
 @app.get("/portfolio/equity-curve", response_model=list[EquityCurvePoint])
@@ -236,12 +330,92 @@ def list_weighted_portfolio_positions(db: DbSession) -> list[PositionWithWeight]
     symbols = sorted({str(position["symbol"]).upper() for position in positions})
     try:
         ticker_map = _load_ticker_map(db, symbols)
+        fundamentals_map = _load_fundamentals_map(db, symbols)
     except SQLAlchemyError as exc:
         raise _database_error(exc) from exc
 
     weighted_positions = compute_position_weights(positions, nav=float(summary["nav"]))
-    enriched_positions = _enrich_positions(weighted_positions, ticker_map)
+    enriched_positions = _enrich_positions(weighted_positions, ticker_map, fundamentals_map)
     return [PositionWithWeight(**position) for position in enriched_positions]
+
+
+@app.get("/portfolio/fundamentals", response_model=list[TickerFundamentalsResponse])
+def list_portfolio_fundamentals(db: DbSession) -> list[TickerFundamentalsResponse]:
+    """Return fundamentals for symbols currently held in Alpaca positions."""
+    try:
+        positions = get_alpaca_client().list_positions()
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    symbols = sorted({str(position["symbol"]).upper() for position in positions})
+    try:
+        fundamentals_map = _load_fundamentals_map(db, symbols)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [_fundamentals_response_from_record(symbol, fundamentals_map.get(symbol)) for symbol in symbols]
+
+
+@app.post("/portfolio/fundamentals/refresh", response_model=FundamentalsRefreshResult)
+def refresh_portfolio_fundamentals(
+    db: DbSession,
+    symbol: str | None = Query(default=None, min_length=1, max_length=16, pattern=r"^[A-Za-z0-9.\-]+$"),
+    stale_only: bool = Query(default=True),
+) -> FundamentalsRefreshResult:
+    """Refresh fundamentals for one ticker or the full local ticker universe."""
+    try:
+        if symbol:
+            normalized_symbol = symbol.upper()
+            if db.get(Ticker, normalized_symbol) is None:
+                raise HTTPException(status_code=404, detail=f"Ticker {normalized_symbol} not found")
+            symbols_to_refresh = [normalized_symbol]
+        else:
+            symbols_to_refresh = sorted({ticker.upper() for ticker in db.scalars(select(Ticker.symbol)).all()})
+
+        if stale_only:
+            stale_symbols = set(get_stale_symbols(db, max_age_hours=24))
+            symbols_to_refresh = [item for item in symbols_to_refresh if item in stale_symbols]
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    refreshed: dict[str, bool] = {}
+    if symbol is None and not stale_only:
+        refreshed = refresh_all_fundamentals(db)
+    else:
+        total = len(symbols_to_refresh)
+        for index, refresh_symbol in enumerate(symbols_to_refresh, start=1):
+            logger.info("Refreshing fundamentals for %s (%s/%s)...", refresh_symbol, index, total)
+            try:
+                refreshed[refresh_symbol] = refresh_ticker_fundamentals(db, refresh_symbol)
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to refresh fundamentals for %s", refresh_symbol)
+                refreshed[refresh_symbol] = False
+
+    succeeded = sum(1 for success in refreshed.values() if success)
+    failed = sum(1 for success in refreshed.values() if not success)
+    return FundamentalsRefreshResult(
+        refreshed=refreshed,
+        total=len(refreshed),
+        succeeded=succeeded,
+        failed=failed,
+    )
+
+
+@app.get("/portfolio/fundamentals/{symbol}", response_model=TickerFundamentalsResponse)
+def get_ticker_fundamentals(symbol: str, db: DbSession) -> TickerFundamentalsResponse:
+    """Return stored fundamentals for a single ticker."""
+    normalized_symbol = symbol.upper()
+    try:
+        ticker = db.get(Ticker, normalized_symbol)
+        record = db.get(TickerFundamentals, normalized_symbol)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    if ticker is None:
+        raise HTTPException(status_code=404, detail=f"Ticker {normalized_symbol} not found")
+
+    return _fundamentals_response_from_record(normalized_symbol, record)
 
 
 @app.get("/portfolio/exposure/sector", response_model=list[ExposureBucket])
@@ -516,6 +690,8 @@ def execute_trade(
 
     try:
         db.add(trade)
+        if db.get(Ticker, payload.ticker.upper()) is None:
+            db.add(Ticker(symbol=payload.ticker.upper()))
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
@@ -544,6 +720,7 @@ def execute_trade(
         thesis_recorded=True,
     )
     background_tasks.add_task(_backfill_symbol_prices_in_background, payload.ticker.upper())
+    background_tasks.add_task(_refresh_symbol_fundamentals_in_background, payload.ticker.upper())
     return response
 
 
@@ -584,6 +761,16 @@ def sync_portfolio(db: DbSession) -> SyncResponse:
 
         db.commit()
         backfill_all_tickers(db)
+        stale_symbols = set(get_stale_symbols(db, max_age_hours=24))
+        symbols_to_refresh = sorted(set(new_tickers_added) | stale_symbols)
+        total = len(symbols_to_refresh)
+        for index, symbol in enumerate(symbols_to_refresh, start=1):
+            logger.info("Refreshing fundamentals for %s (%s/%s)...", symbol, index, total)
+            try:
+                refresh_ticker_fundamentals(db, symbol)
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to refresh fundamentals for %s during sync", symbol)
     except SQLAlchemyError as exc:
         db.rollback()
         raise _database_error(exc) from exc

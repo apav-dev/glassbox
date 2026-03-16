@@ -6,7 +6,20 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Numeric, String, Text, create_engine, inspect, text
+from sqlalchemy import (
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -70,6 +83,38 @@ class Ticker(Base):
     industry: Mapped[str | None] = mapped_column(String(128), nullable=True)
     country: Mapped[str | None] = mapped_column(String(128), nullable=True)
     beta: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class TickerFundamentals(Base):
+    __tablename__ = "ticker_fundamentals"
+
+    symbol: Mapped[str] = mapped_column(
+        String(16),
+        ForeignKey("tickers.symbol"),
+        primary_key=True,
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    market_cap: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
+    trailing_pe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    forward_pe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_to_book: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ev_to_ebitda: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ev_to_revenue: Mapped[float | None] = mapped_column(Float, nullable=True)
+    peg_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_to_sales: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gross_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    operating_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ebitda_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_on_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_on_assets: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_high_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_low_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_mean_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_median_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    analyst_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recommendation_key: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    recommendation_mean: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class RealizedPnl(Base):
@@ -152,6 +197,8 @@ def init_db() -> None:
         DailyPrice.__table__.create(bind=engine)
     if not inspector.has_table("realized_pnl"):
         RealizedPnl.__table__.create(bind=engine)
+    if not inspector.has_table("ticker_fundamentals"):
+        TickerFundamentals.__table__.create(bind=engine)
     ticker_columns = {column["name"] for column in inspector.get_columns("tickers")}
     if "country" not in ticker_columns:
         with engine.begin() as connection:

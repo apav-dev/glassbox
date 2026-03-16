@@ -57,6 +57,11 @@ class PositionResponse(BaseModel):
     company_name: str | None = None
     sector: str | None = None
     industry: str | None = None
+    trailing_pe: float | None = None
+    forward_pe: float | None = None
+    price_to_book: float | None = None
+    target_mean_price: float | None = None
+    recommendation_key: str | None = None
 
 
 class TradeRecord(BaseModel):
