@@ -8,12 +8,14 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alpaca_client import AlpacaClient
-from models import DailyPrice, DailySnapshot, SessionLocal, Ticker, Trade, TradeAction, get_db, init_db
+from cost_basis_schemas import CostBasisResponse, RealizedPnlRecord, RealizedPnlSummary, TickerRealizedPnl
+from cost_basis_service import compute_cost_basis, rebuild_realized_pnl, record_realized_pnl_for_trade
+from models import DailyPrice, DailySnapshot, RealizedPnl, SessionLocal, Ticker, Trade, TradeAction, get_db, init_db
 from price_service import backfill_all_tickers, backfill_ticker_prices
 from risk_schemas import (
     CorrelationMatrixResponse,
@@ -361,6 +363,104 @@ def get_portfolio_stress_test(db: DbSession) -> StressTestResponse:
     )
 
 
+@app.get("/portfolio/cost-basis", response_model=list[CostBasisResponse])
+def get_portfolio_cost_basis(db: DbSession) -> list[CostBasisResponse]:
+    """Return FIFO-based local cost basis and realized P&L by ticker."""
+    try:
+        trades = db.scalars(select(Trade).order_by(Trade.timestamp.asc(), Trade.trade_id.asc())).all()
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    cost_basis = compute_cost_basis(trades)
+    return [
+        CostBasisResponse(
+            symbol=record.symbol,
+            total_qty=record.total_qty,
+            avg_cost=record.avg_cost,
+            total_cost_basis=record.total_cost_basis,
+            realized_pnl=record.realized_pnl,
+            lots=record.lots,
+        )
+        for _, record in sorted(cost_basis.items(), key=lambda item: item[0])
+    ]
+
+
+@app.get("/portfolio/realized-pnl", response_model=RealizedPnlSummary)
+def get_realized_pnl_summary(
+    db: DbSession,
+    ticker: str | None = Query(default=None, min_length=1, max_length=16, pattern=r"^[A-Za-z0-9.\-]+$"),
+    since: datetime | None = Query(default=None),
+) -> RealizedPnlSummary:
+    """Return aggregate realized P&L totals from locally matched sell lots."""
+    filters = []
+    if ticker:
+        filters.append(RealizedPnl.ticker == ticker.upper())
+    if since:
+        filters.append(RealizedPnl.closed_at >= since)
+
+    try:
+        by_ticker_rows = db.execute(
+            select(
+                RealizedPnl.ticker,
+                func.sum(RealizedPnl.pnl),
+                func.count(RealizedPnl.id),
+            )
+            .where(*filters)
+            .group_by(RealizedPnl.ticker)
+            .order_by(RealizedPnl.ticker.asc())
+        ).all()
+        total_realized_pnl = db.scalar(select(func.coalesce(func.sum(RealizedPnl.pnl), 0)).where(*filters)) or 0
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return RealizedPnlSummary(
+        total_realized_pnl=float(total_realized_pnl),
+        by_ticker=[
+            TickerRealizedPnl(
+                symbol=row[0],
+                realized_pnl=float(row[1] or 0),
+                trade_count=int(row[2] or 0),
+            )
+            for row in by_ticker_rows
+        ],
+    )
+
+
+@app.get("/portfolio/realized-pnl/details", response_model=list[RealizedPnlRecord])
+def get_realized_pnl_details(
+    db: DbSession,
+    ticker: str | None = Query(default=None, min_length=1, max_length=16, pattern=r"^[A-Za-z0-9.\-]+$"),
+    since: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[RealizedPnlRecord]:
+    """Return lot-level realized P&L rows from local FIFO matching."""
+    statement = select(RealizedPnl).order_by(RealizedPnl.closed_at.desc(), RealizedPnl.id.desc()).limit(limit).offset(offset)
+    if ticker:
+        statement = statement.where(RealizedPnl.ticker == ticker.upper())
+    if since:
+        statement = statement.where(RealizedPnl.closed_at >= since)
+
+    try:
+        rows = db.scalars(statement).all()
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [RealizedPnlRecord.model_validate(row) for row in rows]
+
+
+@app.post("/portfolio/realized-pnl/rebuild")
+def rebuild_realized_pnl_records(db: DbSession) -> dict[str, int]:
+    """Rebuild the realized P&L table from the local trade log."""
+    try:
+        rows_rebuilt = rebuild_realized_pnl(db)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    return {"rows_rebuilt": rows_rebuilt}
+
+
 @app.get("/trades", response_model=list[TradeRecord])
 def list_trades(
     db: DbSession,
@@ -420,6 +520,14 @@ def execute_trade(
     except SQLAlchemyError as exc:
         db.rollback()
         raise _database_error(exc) from exc
+
+    if trade.action == TradeAction.SELL:
+        try:
+            record_realized_pnl_for_trade(db, trade)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to persist realized P&L rows for sell trade %s", trade.trade_id)
 
     response = TradeResponse(
         order_id=order.get("id", ""),

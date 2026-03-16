@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import Date, DateTime, Enum, Float, Numeric, String, Text, create_engine, inspect, text
+from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Numeric, String, Text, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -72,6 +72,24 @@ class Ticker(Base):
     beta: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class RealizedPnl(Base):
+    __tablename__ = "realized_pnl"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    sell_trade_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("trades.trade_id"),
+        nullable=False,
+        index=True,
+    )
+    qty: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    buy_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    sell_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    pnl: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
 def _normalize_database_url(database_url: str) -> str:
     if database_url.startswith("postgres://"):
         return database_url.replace("postgres://", "postgresql+psycopg://", 1)
@@ -132,6 +150,8 @@ def init_db() -> None:
     inspector = inspect(engine)
     if not inspector.has_table("daily_prices"):
         DailyPrice.__table__.create(bind=engine)
+    if not inspector.has_table("realized_pnl"):
+        RealizedPnl.__table__.create(bind=engine)
     ticker_columns = {column["name"] for column in inspector.get_columns("tickers")}
     if "country" not in ticker_columns:
         with engine.begin() as connection:
