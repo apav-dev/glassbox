@@ -28,6 +28,9 @@ class RiskMetricsResponse(BaseModel):
     annualized_volatility: float | None
     sharpe_ratio: float | None
     sortino_ratio: float | None
+    var_95: float | None
+    var_99: float | None
+    cvar_95: float | None
     max_drawdown: float | None
     max_drawdown_date: date | None
     best_day: ReturnPoint | None

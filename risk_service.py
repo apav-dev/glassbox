@@ -71,6 +71,9 @@ def compute_risk_metrics(
         "annualized_volatility": None,
         "sharpe_ratio": None,
         "sortino_ratio": None,
+        "var_95": None,
+        "var_99": None,
+        "cvar_95": None,
         "max_drawdown": None,
         "max_drawdown_date": None,
         "best_day": None,
@@ -85,6 +88,19 @@ def compute_risk_metrics(
     curve = compute_daily_returns(snapshots)
     daily_returns = [point["daily_return"] for point in curve[1:]]
     negative_returns = [value for value in daily_returns if value < 0]
+    var_95 = None
+    var_99 = None
+    cvar_95 = None
+
+    if len(daily_returns) >= 20:
+        sorted_returns = sorted(daily_returns)
+        var_95_cutoff = sorted_returns[int(len(sorted_returns) * 0.05)]
+        var_99_cutoff = sorted_returns[int(len(sorted_returns) * 0.01)]
+        cvar_95_tail = [value for value in sorted_returns if value <= var_95_cutoff]
+
+        var_95 = abs(var_95_cutoff)
+        var_99 = abs(var_99_cutoff)
+        cvar_95 = abs(statistics.mean(cvar_95_tail))
 
     first_nav = _to_float(snapshots[0].equity_value)
     last_nav = _to_float(snapshots[-1].equity_value)
@@ -123,6 +139,9 @@ def compute_risk_metrics(
         "annualized_volatility": annualized_volatility,
         "sharpe_ratio": sharpe_ratio,
         "sortino_ratio": sortino_ratio,
+        "var_95": var_95,
+        "var_99": var_99,
+        "cvar_95": cvar_95,
         "max_drawdown": abs(max_drawdown_point["drawdown"]),
         "max_drawdown_date": max_drawdown_point["date"],
         "best_day": {
