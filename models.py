@@ -86,6 +86,35 @@ class Ticker(Base):
     beta: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class Tag(Base):
+    __tablename__ = "tags"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    color: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class TickerTag(Base):
+    __tablename__ = "ticker_tags"
+
+    symbol: Mapped[str] = mapped_column(
+        String(16),
+        ForeignKey("tickers.symbol"),
+        primary_key=True,
+    )
+    tag_name: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("tags.name"),
+        primary_key=True,
+    )
+    tagged_by: Mapped[str] = mapped_column(String(64), nullable=False, default="agent")
+    tagged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class TickerFundamentals(Base):
     __tablename__ = "ticker_fundamentals"
 
@@ -220,6 +249,10 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
+    if not inspector.has_table("tags"):
+        Tag.__table__.create(bind=engine)
+    if not inspector.has_table("ticker_tags"):
+        TickerTag.__table__.create(bind=engine)
     if not inspector.has_table("daily_prices"):
         DailyPrice.__table__.create(bind=engine)
     if not inspector.has_table("realized_pnl"):

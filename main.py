@@ -22,12 +22,19 @@ from models import (
     DailySnapshot,
     RealizedPnl,
     SessionLocal,
+    TickerTag,
     Ticker,
     TickerFundamentals,
     Trade,
     TradeAction,
     get_db,
     init_db,
+)
+from position_history_schemas import DailyPositionSnapshot, PositionAtDateResponse, TickerDailyUnits
+from position_history_service import (
+    get_position_at_date,
+    reconstruct_daily_positions,
+    reconstruct_daily_positions_for_ticker,
 )
 from price_service import backfill_all_tickers, backfill_ticker_prices
 from risk_schemas import (
@@ -45,6 +52,7 @@ from risk_service import (
     compute_geographic_exposure,
     compute_position_weights,
     compute_stress_scenarios,
+    compute_thematic_exposure,
     compute_risk_metrics,
     compute_sector_exposure,
 )
@@ -56,6 +64,23 @@ from schemas import (
     TradeRecord,
     TradeRequest,
     TradeResponse,
+)
+from tag_schemas import (
+    BulkTagRequest,
+    TagCreate,
+    TagResponse,
+    TagTickerRequest,
+    ThematicExposureBucket,
+    TickerTagResponse,
+)
+from tag_service import (
+    bulk_tag_ticker,
+    create_tag,
+    get_tag_tickers,
+    get_ticker_tags,
+    list_tags,
+    tag_ticker,
+    untag_ticker,
 )
 from thesis_schemas import ThesisCreate, ThesisResponse, ThesisWithFundamentals
 from thesis_service import close_thesis, create_thesis, get_current_theses, get_current_thesis, get_thesis_history, update_thesis_status
@@ -157,6 +182,45 @@ def _load_price_history(
         statement = statement.where(DailyPrice.date >= start_date)
 
     return db.scalars(statement.order_by(DailyPrice.symbol.asc(), DailyPrice.date.asc())).all()
+
+
+def _load_ticker_tag_map(db: Session, symbols: list[str]) -> dict[str, list[str]]:
+    if not symbols:
+        return {}
+
+    rows = db.scalars(
+        select(TickerTag)
+        .where(TickerTag.symbol.in_([symbol.upper() for symbol in symbols]))
+        .order_by(TickerTag.symbol.asc(), TickerTag.tag_name.asc())
+    ).all()
+    tag_map: dict[str, list[str]] = {}
+    for row in rows:
+        tag_map.setdefault(row.symbol.upper(), []).append(row.tag_name)
+    return tag_map
+
+
+def _validate_history_range(start_date: date, end_date: date) -> None:
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+    if (end_date - start_date).days > 365:
+        raise HTTPException(status_code=400, detail="Date range exceeds 365 days; request a narrower range")
+
+
+def _load_trades_for_date_range(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    symbol: str | None = None,
+) -> list[Trade]:
+    end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    statement = (
+        select(Trade)
+        .where(Trade.timestamp < end_exclusive)
+        .order_by(Trade.timestamp.asc(), Trade.trade_id.asc())
+    )
+    if symbol:
+        statement = statement.where(Trade.ticker == symbol.upper())
+    return db.scalars(statement).all()
 
 
 def _backfill_symbol_prices_in_background(symbol: str) -> None:
@@ -458,6 +522,25 @@ def get_geographic_exposure(db: DbSession) -> list[ExposureBucket]:
     return [ExposureBucket(**bucket) for bucket in buckets]
 
 
+@app.get("/portfolio/exposure/thematic", response_model=list[ThematicExposureBucket])
+def get_thematic_exposure(db: DbSession) -> list[ThematicExposureBucket]:
+    """Return live portfolio exposure grouped by local thematic tags."""
+    try:
+        positions = get_alpaca_client().list_positions()
+        summary = get_alpaca_client().get_account_summary()
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    symbols = sorted({str(position["symbol"]).upper() for position in positions})
+    try:
+        ticker_tag_map = _load_ticker_tag_map(db, symbols)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    buckets = compute_thematic_exposure(positions, ticker_tag_map, nav=float(summary["nav"]))
+    return [ThematicExposureBucket(**bucket) for bucket in buckets]
+
+
 @app.get("/portfolio/risk/report", response_model=PortfolioRiskReport)
 def get_portfolio_risk_report(
     db: DbSession,
@@ -637,6 +720,84 @@ def rebuild_realized_pnl_records(db: DbSession) -> dict[str, int]:
     return {"rows_rebuilt": rows_rebuilt}
 
 
+@app.get("/portfolio/history/positions", response_model=list[DailyPositionSnapshot])
+def get_portfolio_position_history(
+    db: DbSession,
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    starting_cash: float = Query(...),
+) -> list[DailyPositionSnapshot]:
+    """Reconstruct end-of-day positions and cash from the local trade ledger."""
+    _validate_history_range(start_date, end_date)
+
+    try:
+        trades = _load_trades_for_date_range(db, start_date=start_date, end_date=end_date)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [
+        DailyPositionSnapshot(**snapshot)
+        for snapshot in reconstruct_daily_positions(
+            trades,
+            start_date=start_date,
+            end_date=end_date,
+            starting_cash=starting_cash,
+        )
+    ]
+
+
+@app.get("/portfolio/history/positions/{symbol}/at", response_model=PositionAtDateResponse)
+def get_symbol_position_at_date(
+    symbol: str,
+    db: DbSession,
+    date: date = Query(...),
+) -> PositionAtDateResponse:
+    """Return the reconstructed share count for one ticker on a specific date."""
+    normalized_symbol = symbol.upper()
+    try:
+        trades = _load_trades_for_date_range(db, start_date=date, end_date=date, symbol=normalized_symbol)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return PositionAtDateResponse(
+        symbol=normalized_symbol,
+        date=date,
+        shares=get_position_at_date(trades, normalized_symbol, target_date=date),
+    )
+
+
+@app.get("/portfolio/history/positions/{symbol}", response_model=list[TickerDailyUnits])
+def get_symbol_position_history(
+    symbol: str,
+    db: DbSession,
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+) -> list[TickerDailyUnits]:
+    """Return reconstructed daily share counts for one ticker."""
+    normalized_symbol = symbol.upper()
+    _validate_history_range(start_date, end_date)
+
+    try:
+        trades = _load_trades_for_date_range(
+            db,
+            start_date=start_date,
+            end_date=end_date,
+            symbol=normalized_symbol,
+        )
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [
+        TickerDailyUnits(**snapshot)
+        for snapshot in reconstruct_daily_positions_for_ticker(
+            trades,
+            symbol=normalized_symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    ]
+
+
 @app.get("/trades", response_model=list[TradeRecord])
 def list_trades(
     db: DbSession,
@@ -659,6 +820,95 @@ def list_trades(
         raise _database_error(exc) from exc
 
     return [TradeRecord.model_validate(trade) for trade in trades]
+
+
+@app.get("/tags", response_model=list[TagResponse])
+def get_tags(db: DbSession) -> list[TagResponse]:
+    """List all local thematic tags."""
+    try:
+        rows = list_tags(db)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [TagResponse.model_validate(row) for row in rows]
+
+
+@app.post("/tags", response_model=TagResponse)
+def create_tag_record(payload: TagCreate, db: DbSession) -> TagResponse:
+    """Create a thematic tag if it does not already exist."""
+    try:
+        row = create_tag(db, name=payload.name, color=payload.color, description=payload.description)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    return TagResponse.model_validate(row)
+
+
+@app.get("/tags/{tag_name}/tickers", response_model=list[str])
+def list_tagged_tickers(tag_name: str, db: DbSession) -> list[str]:
+    """Return all symbols assigned to a thematic tag."""
+    try:
+        return get_tag_tickers(db, tag_name)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+
+@app.get("/tickers/{symbol}/tags", response_model=list[TagResponse])
+def list_ticker_tags(symbol: str, db: DbSession) -> list[TagResponse]:
+    """Return all thematic tags assigned to a ticker."""
+    try:
+        rows = get_ticker_tags(db, symbol)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [TagResponse.model_validate(row) for row in rows]
+
+
+@app.post("/tickers/{symbol}/tags", response_model=TickerTagResponse)
+def create_ticker_tag(symbol: str, payload: TagTickerRequest, db: DbSession) -> TickerTagResponse:
+    """Apply a thematic tag to a ticker."""
+    if payload.symbol.upper() != symbol.upper():
+        raise HTTPException(status_code=400, detail="Path symbol must match payload symbol")
+
+    try:
+        row = tag_ticker(db, symbol=symbol, tag_name=payload.tag_name, tagged_by=payload.tagged_by)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    return TickerTagResponse.model_validate(row)
+
+
+@app.post("/tickers/{symbol}/tags/bulk", response_model=list[TickerTagResponse])
+def create_ticker_tags_bulk(
+    symbol: str,
+    payload: BulkTagRequest,
+    db: DbSession,
+) -> list[TickerTagResponse]:
+    """Apply multiple thematic tags to a ticker."""
+    if payload.symbol.upper() != symbol.upper():
+        raise HTTPException(status_code=400, detail="Path symbol must match payload symbol")
+
+    try:
+        rows = bulk_tag_ticker(db, symbol=symbol, tag_names=payload.tag_names, tagged_by=payload.tagged_by)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    return [TickerTagResponse.model_validate(row) for row in rows]
+
+
+@app.delete("/tickers/{symbol}/tags/{tag_name}")
+def delete_ticker_tag(symbol: str, tag_name: str, db: DbSession) -> dict[str, bool]:
+    """Remove a thematic tag from a ticker."""
+    try:
+        removed = untag_ticker(db, symbol=symbol, tag_name=tag_name)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _database_error(exc) from exc
+
+    return {"removed": removed}
 
 
 @app.get("/theses", response_model=list[ThesisResponse])

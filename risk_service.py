@@ -315,6 +315,42 @@ def compute_geographic_exposure(
     return _compute_exposure(positions, ticker_map, nav, attribute="country")
 
 
+def compute_thematic_exposure(
+    positions: list[dict[str, Any]],
+    ticker_tag_map: dict[str, list[str]],
+    nav: float,
+) -> list[dict[str, Any]]:
+    exposure_map: dict[str, dict[str, Any]] = {}
+
+    for position in positions:
+        symbol = str(position.get("symbol", "")).upper()
+        tag_names = sorted({tag for tag in ticker_tag_map.get(symbol, []) if tag})
+        if not tag_names:
+            continue
+
+        market_value = _to_float(position.get("market_value"))
+        for tag_name in tag_names:
+            bucket = exposure_map.setdefault(
+                tag_name,
+                {
+                    "tag": tag_name,
+                    "total_market_value": 0.0,
+                    "weight": 0.0,
+                    "position_count": 0,
+                    "symbols": [],
+                },
+            )
+            bucket["total_market_value"] += market_value
+            bucket["position_count"] += 1
+            bucket["symbols"].append(symbol)
+
+    for bucket in exposure_map.values():
+        bucket["weight"] = (bucket["total_market_value"] / nav) if nav else 0.0
+        bucket["symbols"].sort()
+
+    return sorted(exposure_map.values(), key=lambda bucket: bucket["weight"], reverse=True)
+
+
 def _compute_exposure(
     positions: list[dict[str, Any]],
     ticker_map: dict[str, TickerLike],
