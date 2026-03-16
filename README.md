@@ -57,6 +57,7 @@ Stores reference metadata used for enrichment and sector-risk calculations.
 - `company_name`: company name
 - `sector`: sector label
 - `industry`: industry label
+- `country`: country label for geographic exposure
 - `beta`: optional beta value
 
 ## Environment Setup
@@ -140,6 +141,26 @@ Returns risk metrics such as:
 - sector exposure
 
 This endpoint will combine Alpaca positions with local snapshot and ticker metadata.
+
+### `GET /portfolio/equity-curve`
+
+Returns the local daily NAV series with daily return, cumulative return, and drawdown fields.
+
+### `GET /portfolio/positions/weighted`
+
+Returns live Alpaca positions enriched with local ticker metadata plus current portfolio weight.
+
+### `GET /portfolio/exposure/sector`
+
+Returns live exposure grouped by sector from the local `tickers` table.
+
+### `GET /portfolio/exposure/geographic`
+
+Returns live exposure grouped by country from the local `tickers` table.
+
+### `GET /portfolio/risk/report`
+
+Returns the combined risk metrics, sector exposure, and geographic exposure in one response.
 
 ### `POST /trade/execute`
 

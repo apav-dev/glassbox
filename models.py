@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import Date, DateTime, Enum, Float, Numeric, String, Text, create_engine
+from sqlalchemy import Date, DateTime, Enum, Float, Numeric, String, Text, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -59,6 +59,7 @@ class Ticker(Base):
     company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sector: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     industry: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(128), nullable=True)
     beta: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
@@ -119,6 +120,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    inspector = inspect(engine)
+    ticker_columns = {column["name"] for column in inspector.get_columns("tickers")}
+    if "country" not in ticker_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tickers ADD COLUMN country VARCHAR(128)"))
 
 
 def get_db() -> Iterator[Session]:

@@ -12,6 +12,20 @@ from sqlalchemy.orm import Session
 
 from alpaca_client import AlpacaClient
 from models import DailySnapshot, Ticker, Trade, TradeAction, get_db, init_db
+from risk_schemas import (
+    EquityCurvePoint,
+    ExposureBucket,
+    PortfolioRiskReport,
+    PositionWithWeight,
+    RiskMetricsResponse,
+)
+from risk_service import (
+    compute_daily_returns,
+    compute_geographic_exposure,
+    compute_position_weights,
+    compute_risk_metrics,
+    compute_sector_exposure,
+)
 from schemas import (
     HealthResponse,
     PortfolioSummaryResponse,
@@ -52,6 +66,33 @@ def _alpaca_error(exc: Exception) -> HTTPException:
 
 def _database_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+def _load_ticker_map(db: Session, symbols: list[str]) -> dict[str, Ticker]:
+    if not symbols:
+        return {}
+
+    ticker_rows = db.scalars(select(Ticker).where(Ticker.symbol.in_(symbols))).all()
+    return {ticker.symbol.upper(): ticker for ticker in ticker_rows}
+
+
+def _enrich_positions(
+    positions: list[dict[str, float | str]],
+    ticker_map: dict[str, Ticker],
+) -> list[dict[str, float | str | None]]:
+    enriched_positions: list[dict[str, float | str | None]] = []
+    for position in positions:
+        ticker_record = ticker_map.get(str(position["symbol"]).upper())
+        enriched_positions.append(
+            {
+                **position,
+                "company_name": ticker_record.company_name if ticker_record else None,
+                "sector": ticker_record.sector if ticker_record else None,
+                "industry": ticker_record.industry if ticker_record else None,
+            }
+        )
+
+    return enriched_positions
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -100,28 +141,131 @@ def list_portfolio_positions(db: DbSession) -> list[PositionResponse]:
         raise _alpaca_error(exc) from exc
 
     symbols = sorted({str(position["symbol"]).upper() for position in positions})
-    ticker_map: dict[str, Ticker] = {}
-
     if symbols:
         try:
-            ticker_rows = db.scalars(select(Ticker).where(Ticker.symbol.in_(symbols))).all()
+            ticker_map = _load_ticker_map(db, symbols)
         except SQLAlchemyError as exc:
             raise _database_error(exc) from exc
-        ticker_map = {ticker.symbol.upper(): ticker for ticker in ticker_rows}
+    else:
+        ticker_map = {}
 
-    enriched_positions: list[PositionResponse] = []
-    for position in positions:
-        ticker_record = ticker_map.get(str(position["symbol"]).upper())
-        enriched_positions.append(
-            PositionResponse(
-                **position,
-                company_name=ticker_record.company_name if ticker_record else None,
-                sector=ticker_record.sector if ticker_record else None,
-                industry=ticker_record.industry if ticker_record else None,
-            )
+    return [PositionResponse(**position) for position in _enrich_positions(positions, ticker_map)]
+
+
+@app.get("/portfolio/equity-curve", response_model=list[EquityCurvePoint])
+def get_portfolio_equity_curve(db: DbSession) -> list[EquityCurvePoint]:
+    """Return the local equity curve derived from stored daily snapshots."""
+    try:
+        snapshots = db.scalars(select(DailySnapshot).order_by(DailySnapshot.date.asc())).all()
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return [EquityCurvePoint(**point) for point in compute_daily_returns(snapshots)]
+
+
+@app.get("/portfolio/risk", response_model=RiskMetricsResponse)
+def get_portfolio_risk(
+    db: DbSession,
+    risk_free_rate: float = Query(default=0.045),
+) -> RiskMetricsResponse:
+    """Return portfolio-level return and drawdown metrics derived from stored daily snapshots."""
+    try:
+        snapshots = db.scalars(select(DailySnapshot).order_by(DailySnapshot.date.asc())).all()
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    return RiskMetricsResponse(**compute_risk_metrics(snapshots, risk_free_rate=risk_free_rate))
+
+
+@app.get("/portfolio/positions/weighted", response_model=list[PositionWithWeight])
+def list_weighted_portfolio_positions(db: DbSession) -> list[PositionWithWeight]:
+    """Return live positions with current portfolio weights and local ticker metadata."""
+    try:
+        positions = get_alpaca_client().list_positions()
+        summary = get_alpaca_client().get_account_summary()
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    symbols = sorted({str(position["symbol"]).upper() for position in positions})
+    try:
+        ticker_map = _load_ticker_map(db, symbols)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    weighted_positions = compute_position_weights(positions, nav=float(summary["nav"]))
+    enriched_positions = _enrich_positions(weighted_positions, ticker_map)
+    return [PositionWithWeight(**position) for position in enriched_positions]
+
+
+@app.get("/portfolio/exposure/sector", response_model=list[ExposureBucket])
+def get_sector_exposure(db: DbSession) -> list[ExposureBucket]:
+    """Return live portfolio exposure grouped by sector using local ticker metadata."""
+    try:
+        positions = get_alpaca_client().list_positions()
+        summary = get_alpaca_client().get_account_summary()
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    symbols = sorted({str(position["symbol"]).upper() for position in positions})
+    try:
+        ticker_map = _load_ticker_map(db, symbols)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    buckets = compute_sector_exposure(positions, ticker_map, nav=float(summary["nav"]))
+    return [ExposureBucket(**bucket) for bucket in buckets]
+
+
+@app.get("/portfolio/exposure/geographic", response_model=list[ExposureBucket])
+def get_geographic_exposure(db: DbSession) -> list[ExposureBucket]:
+    """Return live portfolio exposure grouped by country using local ticker metadata."""
+    try:
+        positions = get_alpaca_client().list_positions()
+        summary = get_alpaca_client().get_account_summary()
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
+
+    symbols = sorted({str(position["symbol"]).upper() for position in positions})
+    try:
+        ticker_map = _load_ticker_map(db, symbols)
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+
+    buckets = compute_geographic_exposure(positions, ticker_map, nav=float(summary["nav"]))
+    return [ExposureBucket(**bucket) for bucket in buckets]
+
+
+@app.get("/portfolio/risk/report", response_model=PortfolioRiskReport)
+def get_portfolio_risk_report(
+    db: DbSession,
+    risk_free_rate: float = Query(default=0.045),
+) -> PortfolioRiskReport:
+    """Return a combined portfolio risk report covering history, sector exposure, and geographic exposure."""
+    try:
+        snapshots = db.scalars(select(DailySnapshot).order_by(DailySnapshot.date.asc())).all()
+        positions = get_alpaca_client().list_positions()
+        summary = get_alpaca_client().get_account_summary()
+        ticker_map = _load_ticker_map(
+            db,
+            sorted({str(position["symbol"]).upper() for position in positions}),
         )
+    except SQLAlchemyError as exc:
+        raise _database_error(exc) from exc
+    except Exception as exc:
+        raise _alpaca_error(exc) from exc
 
-    return enriched_positions
+    nav = float(summary["nav"])
+    return PortfolioRiskReport(
+        risk_metrics=RiskMetricsResponse(**compute_risk_metrics(snapshots, risk_free_rate=risk_free_rate)),
+        sector_exposure=[
+            ExposureBucket(**bucket)
+            for bucket in compute_sector_exposure(positions, ticker_map, nav=nav)
+        ],
+        geographic_exposure=[
+            ExposureBucket(**bucket)
+            for bucket in compute_geographic_exposure(positions, ticker_map, nav=nav)
+        ],
+    )
 
 
 @app.get("/trades", response_model=list[TradeRecord])
