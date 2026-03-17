@@ -7,9 +7,9 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-import price_service
-from models import Base, DailyPrice, Ticker
-from risk_service import compute_correlation_matrix, compute_portfolio_beta, compute_stress_scenarios
+import glassbox.services.price as price_service
+from glassbox.db.models import Base, DailyPrice, Ticker
+from glassbox.services.risk import compute_correlation_matrix, compute_portfolio_beta, compute_stress_scenarios
 
 
 @dataclass

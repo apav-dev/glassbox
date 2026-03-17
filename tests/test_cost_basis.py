@@ -9,8 +9,8 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from cost_basis_service import compute_cost_basis, rebuild_realized_pnl, record_realized_pnl_for_trade
-from models import Base, RealizedPnl, Trade, TradeAction
+from glassbox.services.cost_basis import compute_cost_basis, rebuild_realized_pnl, record_realized_pnl_for_trade
+from glassbox.db.models import Base, RealizedPnl, Trade, TradeAction
 
 
 @dataclass

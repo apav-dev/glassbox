@@ -4,8 +4,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Base, Ticker
-from thesis_service import (
+from glassbox.db.models import Base, Ticker
+from glassbox.services.theses import (
     close_thesis,
     create_thesis,
     get_current_theses,

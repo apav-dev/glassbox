@@ -6,10 +6,10 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-import fundamentals_provider
-import fundamentals_service
-from fundamentals_provider import YFinanceFundamentalsProvider
-from models import Base, Ticker, TickerFundamentals
+import glassbox.providers.fundamentals as fundamentals_provider
+import glassbox.services.fundamentals as fundamentals_service
+from glassbox.providers.fundamentals import YFinanceFundamentalsProvider
+from glassbox.db.models import Base, Ticker, TickerFundamentals
 
 
 @pytest.fixture

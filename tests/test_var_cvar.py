@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from risk_service import compute_risk_metrics
+from glassbox.services.risk import compute_risk_metrics
 
 
 @dataclass

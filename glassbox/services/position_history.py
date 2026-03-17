@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
-from models import Trade, TradeAction
+from glassbox.db.models import Trade, TradeAction
 
 
 ZERO = Decimal("0")

@@ -6,8 +6,8 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from alpaca_client import AlpacaClient
-from models import DailyPrice, Ticker
+from glassbox.clients.alpaca import AlpacaClient
+from glassbox.db.models import DailyPrice, Ticker
 
 
 def fetch_daily_prices(symbol: str, start_date: date, end_date: date) -> list[dict[str, Any]]:

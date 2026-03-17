@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Tag, Ticker, TickerTag
+from glassbox.db.models import Tag, Ticker, TickerTag
 
 
 def _normalize_symbol(symbol: str) -> str:

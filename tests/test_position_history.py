@@ -5,8 +5,8 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from models import TradeAction
-from position_history_service import (
+from glassbox.db.models import TradeAction
+from glassbox.services.position_history import (
     get_position_at_date,
     reconstruct_daily_positions,
     reconstruct_daily_positions_for_ticker,

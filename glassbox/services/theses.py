@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import InvestmentThesis, Ticker
+from glassbox.db.models import InvestmentThesis, Ticker
 
 
 VALID_THESIS_STATUSES = {"active", "closed", "watching"}

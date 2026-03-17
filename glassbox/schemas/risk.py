@@ -4,7 +4,7 @@ from datetime import date
 
 from pydantic import BaseModel
 
-from schemas import PositionResponse
+from glassbox.schemas.trading import PositionResponse
 
 
 class EquityCurvePoint(BaseModel):

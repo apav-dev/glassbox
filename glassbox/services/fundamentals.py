@@ -7,8 +7,8 @@ from time import sleep
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from fundamentals_provider import get_fundamentals_provider
-from models import Ticker, TickerFundamentals
+from glassbox.providers.fundamentals import get_fundamentals_provider
+from glassbox.db.models import Ticker, TickerFundamentals
 
 
 logger = logging.getLogger(__name__)

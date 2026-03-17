@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from models import RealizedPnl, Trade, TradeAction
+from glassbox.db.models import RealizedPnl, Trade, TradeAction
 
 
 logger = logging.getLogger(__name__)

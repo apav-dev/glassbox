@@ -3,9 +3,9 @@ from __future__ import annotations
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Base, Tag, Ticker, TickerTag
-from risk_service import compute_thematic_exposure
-from tag_service import (
+from glassbox.db.models import Base, Tag, Ticker, TickerTag
+from glassbox.services.risk import compute_thematic_exposure
+from glassbox.services.tags import (
     bulk_tag_ticker,
     create_tag,
     get_tag_tickers,
