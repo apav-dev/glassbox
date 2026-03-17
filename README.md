@@ -187,6 +187,38 @@ python mcp_server.py
 
 The MCP server uses the streamable HTTP transport and forwards requests to the FastAPI backend defined by `GLASSBOX_BASE_URL`.
 
+### Using With Claude Via MCP
+
+To use this server from Claude, start both services first:
+
+1. Start the FastAPI app on `http://localhost:8000`
+2. Start the MCP server on `http://localhost:8100` or your configured `MCP_PORT`
+
+If you keep credentials in a local `.env` file, load them into your shell before starting either process because this repo does not auto-load `.env` files:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+As of March 17, 2026, the practical setup is:
+
+- Claude Desktop: add a remote MCP connector pointing at `http://localhost:8100`
+- Claude Code: add an HTTP MCP server that points at `http://localhost:8100`
+
+For Claude Code, the command is:
+
+```bash
+claude mcp add --transport http glassbox http://localhost:8100
+```
+
+Notes:
+
+- This server is currently unauthenticated, so it is intended for local development on your machine.
+- `localhost` works when Claude is running on the same machine as the server. If you want to use a remote Claude client that cannot reach your laptop directly, you need to expose the MCP server on a reachable host and secure it appropriately.
+- Once connected, Claude will see the MCP tools exposed by `glassbox/api/mcp.py`, such as health checks, sync, portfolio analytics, trade execution, tags, and thesis management.
+
 ## Core Runtime Flows
 
 ### `/sync`
