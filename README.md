@@ -219,6 +219,44 @@ Notes:
 - `localhost` works when Claude is running on the same machine as the server. If you want to use a remote Claude client that cannot reach your laptop directly, you need to expose the MCP server on a reachable host and secure it appropriately.
 - Once connected, Claude will see the MCP tools exposed by `glassbox/api/mcp.py`, such as health checks, sync, portfolio analytics, trade execution, tags, and thesis management.
 
+#### Stdio Transport
+
+You can also run Glassbox as a self-contained stdio MCP server without starting FastAPI.
+
+Install the repo in editable mode first so the CLI entry point is registered:
+
+```bash
+pip install -e .
+```
+
+For Claude Code, register the stdio server with:
+
+```bash
+claude mcp add glassbox glassbox-mcp-server
+```
+
+For Claude Desktop, add this `mcpServers` entry:
+
+```json
+{
+  "mcpServers": {
+    "glassbox": {
+      "command": "glassbox-mcp-server",
+      "env": {
+        "ALPACA_API_KEY": "your-key",
+        "ALPACA_SECRET_KEY": "your-secret",
+        "DATABASE_URL": "sqlite:///./glassbox.db"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- This mode is self-contained. The FastAPI app does not need to be running.
+- The stdio and HTTP transports expose the same MCP tool names, so Claude sees the same interface in either mode.
+
 ## Core Runtime Flows
 
 ### `/sync`

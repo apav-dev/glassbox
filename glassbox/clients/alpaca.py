@@ -31,11 +31,11 @@ class AlpacaSettings:
     @classmethod
     def from_env(cls) -> "AlpacaSettings":
         api_key = os.getenv("ALPACA_API_KEY")
-        api_secret = os.getenv("ALPACA_API_SECRET")
+        api_secret = os.getenv("ALPACA_API_SECRET") or os.getenv("ALPACA_SECRET_KEY")
 
         if not api_key or not api_secret:
             raise AlpacaConfigurationError(
-                "Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET."
+                "Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET or ALPACA_SECRET_KEY."
             )
 
         return cls(
