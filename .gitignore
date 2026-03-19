@@ -24,3 +24,7 @@ glassbox.db
 *.sqlite3
 
 .DS_Store
+
+# Build artifacts
+build/
+glassbox.egg-info/
