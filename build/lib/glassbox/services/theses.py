@@ -29,29 +29,6 @@ def create_thesis(
     status: str = "active",
     created_by: str = "agent",
 ) -> InvestmentThesis:
-    row = append_thesis_version(
-        db,
-        symbol=symbol,
-        thesis=thesis,
-        catalyst=catalyst,
-        edge=edge,
-        status=status,
-        created_by=created_by,
-    )
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-def append_thesis_version(
-    db: Session,
-    symbol: str,
-    thesis: str,
-    catalyst: str | None,
-    edge: str | None,
-    status: str = "active",
-    created_by: str = "agent",
-) -> InvestmentThesis:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_status = _validate_status(status)
 
@@ -74,27 +51,19 @@ def append_thesis_version(
         created_by=created_by,
     )
     db.add(row)
-    db.flush()
+    db.commit()
+    db.refresh(row)
     return row
 
 
 def update_thesis_status(db: Session, symbol: str, status: str) -> InvestmentThesis | None:
-    current = set_current_thesis_status(db, symbol, status)
-    if current is None:
-        return None
-
-    db.commit()
-    db.refresh(current)
-    return current
-
-
-def set_current_thesis_status(db: Session, symbol: str, status: str) -> InvestmentThesis | None:
     current = get_current_thesis(db, symbol)
     if current is None:
         return None
 
     current.status = _validate_status(status)
-    db.flush()
+    db.commit()
+    db.refresh(current)
     return current
 
 
@@ -154,38 +123,3 @@ def get_thesis_history(db: Session, symbol: str) -> list[InvestmentThesis]:
 
 def close_thesis(db: Session, symbol: str) -> InvestmentThesis | None:
     return update_thesis_status(db, symbol, "closed")
-
-
-def sync_buy_trade_thesis(
-    db: Session,
-    symbol: str,
-    thesis: str,
-    *,
-    created_by: str = "agent",
-) -> str:
-    current = get_current_thesis(db, symbol)
-    if current is None:
-        append_thesis_version(
-            db,
-            symbol=symbol,
-            thesis=thesis,
-            catalyst=None,
-            edge=None,
-            status="active",
-            created_by=created_by,
-        )
-        return "created"
-
-    if current.status == "active" and current.thesis == thesis:
-        return "unchanged"
-
-    append_thesis_version(
-        db,
-        symbol=symbol,
-        thesis=thesis,
-        catalyst=current.catalyst,
-        edge=current.edge,
-        status="active",
-        created_by=created_by,
-    )
-    return "versioned"

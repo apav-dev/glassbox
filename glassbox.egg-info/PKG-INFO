@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: glassbox
+Version: 0.1.1
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: starlette<0.47,>=0.40
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
+Requires-Dist: sqlalchemy<3.0,>=2.0
+Requires-Dist: pydantic<3.0,>=2.11
+Requires-Dist: alpaca-py<1.0,>=0.43
+Requires-Dist: yfinance<2.0,>=1.0
+Requires-Dist: mcp<2.0.0,>=1.0.0
+Requires-Dist: sse-starlette<3.0,>=1.6.1
+Requires-Dist: httpx<1.0,>=0.27.0
+Requires-Dist: pytz<2027,>=2024

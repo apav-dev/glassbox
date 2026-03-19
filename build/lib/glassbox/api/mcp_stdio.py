@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
+from uuid import uuid4
 
 from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP
@@ -33,6 +34,7 @@ from glassbox.db.models import (
     Ticker,
     TickerFundamentals,
     Trade,
+    TradeAction,
     init_db,
 )
 from glassbox.schemas.cost_basis import CostBasisResponse, RealizedPnlRecord, RealizedPnlSummary, TickerRealizedPnl
@@ -61,6 +63,7 @@ from glassbox.schemas.trading import (
 from glassbox.services.cost_basis import (
     compute_cost_basis,
     rebuild_realized_pnl as rebuild_realized_pnl_service,
+    record_realized_pnl_for_trade,
 )
 from glassbox.services.fundamentals import get_stale_symbols, refresh_all_fundamentals, refresh_ticker_fundamentals
 from glassbox.services.position_history import (
@@ -89,13 +92,13 @@ from glassbox.services.tags import (
     untag_ticker as untag_ticker_service,
 )
 from glassbox.services.theses import (
+    close_thesis,
     create_thesis as create_thesis_service,
     get_current_theses,
     get_current_thesis,
     get_thesis_history,
     update_thesis_status as update_thesis_status_service,
 )
-from glassbox.services.trading import execute_trade as execute_trade_service
 
 
 logger = logging.getLogger(__name__)
@@ -330,7 +333,7 @@ def execute_trade(
     order_type: str = "market",
     time_in_force: str = "day",
 ) -> dict | list:
-    """Submits an Alpaca order, records the trade ledger, syncs buy theses, and closes theses on full exits."""
+    """Submits an Alpaca order and logs trade metadata locally. Requires a ticker, side, quantity, and investment thesis."""
     def operation() -> dict:
         payload = TradeRequest(
             ticker=ticker,
@@ -342,24 +345,65 @@ def execute_trade(
             time_in_force=time_in_force,
         )
         alpaca_client = get_alpaca_client()
+        order = alpaca_client.submit_order(
+            symbol=payload.ticker,
+            side=payload.side,
+            qty=payload.qty,
+            order_type=payload.order_type,
+            time_in_force=payload.time_in_force,
+        )
+
+        local_trade_id = order.get("id") or f"glassbox-{uuid4()}"
+        trade = Trade(
+            trade_id=local_trade_id,
+            ticker=payload.ticker.upper(),
+            action=TradeAction.BUY if payload.side == "buy" else TradeAction.SELL,
+            qty=payload.qty,
+            price=order.get("filled_avg_price") or None,
+            strategy_tag=payload.strategy_tag,
+            investment_thesis=payload.thesis,
+        )
 
         with _db() as db:
-            result = execute_trade_service(db, alpaca_client, payload)
+            db.add(trade)
+            if db.get(Ticker, payload.ticker.upper()) is None:
+                db.add(Ticker(symbol=payload.ticker.upper()))
+            db.commit()
+
+            if trade.action == TradeAction.SELL:
+                try:
+                    record_realized_pnl_for_trade(db, trade)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("Failed to persist realized P&L rows for sell trade %s", trade.trade_id)
+
+                try:
+                    positions = alpaca_client.list_positions()
+                    open_symbols = {str(position["symbol"]).upper() for position in positions}
+                    if payload.ticker.upper() not in open_symbols:
+                        close_thesis(db, payload.ticker.upper())
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "Failed to auto-close thesis for %s after sell trade %s",
+                        payload.ticker.upper(),
+                        trade.trade_id,
+                    )
 
         response = TradeResponse(
-            order_id=result.order.get("id", ""),
-            client_order_id=result.order.get("client_order_id", ""),
-            status=result.order.get("status", ""),
-            symbol=result.order.get("symbol", payload.ticker.upper()),
-            side=result.order.get("side", payload.side),
-            qty=result.order.get("qty", payload.qty),
-            filled_qty=result.order.get("filled_qty", 0.0),
-            filled_avg_price=result.order.get("filled_avg_price", 0.0),
-            submitted_at=result.order.get("submitted_at"),
-            local_trade_id=result.local_trade_id,
+            order_id=order.get("id", ""),
+            client_order_id=order.get("client_order_id", ""),
+            status=order.get("status", ""),
+            symbol=order.get("symbol", payload.ticker.upper()),
+            side=order.get("side", payload.side),
+            qty=order.get("qty", payload.qty),
+            filled_qty=order.get("filled_qty", 0.0),
+            filled_avg_price=order.get("filled_avg_price", 0.0),
+            submitted_at=order.get("submitted_at"),
+            local_trade_id=local_trade_id,
             strategy_tag=payload.strategy_tag,
-            thesis_recorded=result.thesis_recorded,
-            thesis_action=result.thesis_action,
+            thesis_recorded=True,
         )
         backfill_symbol_prices_in_background(payload.ticker.upper())
         refresh_symbol_fundamentals_in_background(payload.ticker.upper())

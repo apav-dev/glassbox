@@ -101,15 +101,18 @@ Required for live account access, sync, order execution, and price backfills:
 
 ```bash
 export ALPACA_API_KEY="your-key"
-export ALPACA_API_SECRET="your-secret"
+export ALPACA_SECRET_KEY="your-secret"
 ```
 
 Optional:
 
 ```bash
+export ALPACA_PAPER="true"
 export ALPACA_BASE_URL="https://paper-api.alpaca.markets"
-export ALPACA_API_VERSION="v2"
+export ALPACA_DATA_BASE_URL=""
 ```
+
+`ALPACA_API_SECRET` is still accepted as a backward-compatible alias for `ALPACA_SECRET_KEY`.
 
 ### Database
 
@@ -150,11 +153,11 @@ export GLASSBOX_TIMEOUT_SECONDS="30"
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 pip install pytest
 ```
 
-`pytest` is used by the test suite but is not currently listed in `requirements.txt`, so install it separately for local development.
+`pytest` is used by the test suite but is not currently listed in the package metadata, so install it separately for local development.
 
 ## Running The Services
 
@@ -223,16 +226,35 @@ Notes:
 
 You can also run Glassbox as a self-contained stdio MCP server without starting FastAPI.
 
-Install the repo in editable mode first so the CLI entry point is registered:
+Install the repo in editable mode first:
 
 ```bash
 pip install -e .
 ```
 
+To mirror Alpaca's MCP setup style, Glassbox now supports:
+
+```bash
+glassbox-mcp-server init
+glassbox-mcp-server serve
+```
+
 For Claude Code, register the stdio server with:
 
 ```bash
-claude mcp add glassbox glassbox-mcp-server
+claude mcp add glassbox uvx --from /absolute/path/to/glassbox glassbox-mcp-server serve
+```
+
+You can also print a ready-to-paste Claude Desktop config snippet from the repo root:
+
+```bash
+uvx --from /absolute/path/to/glassbox glassbox-mcp-server init
+```
+
+By default, the generated config points `uvx` at `/absolute/path/to/glassbox/.env`, so Claude Desktop reuses the same local `.env` file instead of duplicating secrets into the config. You can override that with:
+
+```bash
+uvx --from /absolute/path/to/glassbox glassbox-mcp-server init --env-file /absolute/path/to/your.env
 ```
 
 For Claude Desktop, add this `mcpServers` entry:
@@ -241,12 +263,18 @@ For Claude Desktop, add this `mcpServers` entry:
 {
   "mcpServers": {
     "glassbox": {
-      "command": "glassbox-mcp-server",
-      "env": {
-        "ALPACA_API_KEY": "your-key",
-        "ALPACA_SECRET_KEY": "your-secret",
-        "DATABASE_URL": "sqlite:///./glassbox.db"
-      }
+      "type": "stdio",
+      "command": "/absolute/path/to/uvx",
+      "args": [
+        "--directory",
+        "/absolute/path/to/glassbox",
+        "--env-file",
+        "/absolute/path/to/glassbox/.env",
+        "--from",
+        "/absolute/path/to/glassbox",
+        "glassbox-mcp-server",
+        "serve"
+      ]
     }
   }
 }
@@ -256,6 +284,10 @@ Notes:
 
 - This mode is self-contained. The FastAPI app does not need to be running.
 - The stdio and HTTP transports expose the same MCP tool names, so Claude sees the same interface in either mode.
+- `uvx --from /absolute/path/to/glassbox ...` is the local-repo equivalent of Alpaca's published-package `uvx alpaca-mcp-server ...` flow.
+- Claude Desktop may not inherit the same shell PATH as Terminal. Using the absolute `uvx` path is more reliable than `"uvx"`.
+- Your `.env` must contain the values Claude needs at runtime, typically `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `DATABASE_URL`.
+- `--directory /absolute/path/to/glassbox` ensures relative paths in `.env`, such as `sqlite:///./glassbox.db`, resolve against the repo instead of Claude Desktop's own working directory.
 
 ## Core Runtime Flows
 
@@ -278,11 +310,13 @@ Use `/sync` before portfolio analytics if you want fresh local history and enric
 1. Submits the order to Alpaca
 2. Writes a local `trades` row with thesis text and optional strategy tag
 3. Auto-creates a bare `tickers` row if needed
-4. For sells, writes lot-matched realized P&L rows
-5. For sells, auto-closes the current thesis if the symbol is no longer in live Alpaca positions
-6. Kicks off background price and fundamentals refresh for the traded symbol
+4. For buys, synchronizes `investment_theses` by creating a first active thesis or appending a new active version when the thesis changed
+5. For sells, writes lot-matched realized P&L rows
+6. For full exits, auto-closes the current thesis if the symbol is no longer in live Alpaca positions
+7. Kicks off background price and fundamentals refresh for the traded symbol
 
 Important: ledger-based analytics depend on the local `trades` row, not Alpaca order history.
+Sell-side thesis text is stored on the trade ledger only and does not create a new thesis version.
 
 ## API Overview
 

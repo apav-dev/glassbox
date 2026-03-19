@@ -1,5 +1,8 @@
 from __future__ import annotations
+
+import logging
 from datetime import date, datetime
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Query
 from sqlalchemy import func, select
@@ -13,19 +16,21 @@ from glassbox.api.helpers import (
     refresh_symbol_fundamentals_in_background,
     validate_history_range,
 )
-from glassbox.db.models import RealizedPnl, Trade
+from glassbox.db.models import RealizedPnl, Ticker, Trade, TradeAction
 from glassbox.schemas.cost_basis import CostBasisResponse, RealizedPnlRecord, RealizedPnlSummary, TickerRealizedPnl
 from glassbox.schemas.position_history import DailyPositionSnapshot, PositionAtDateResponse, TickerDailyUnits
 from glassbox.schemas.trading import TradeRecord, TradeRequest, TradeResponse
-from glassbox.services.cost_basis import compute_cost_basis, rebuild_realized_pnl
+from glassbox.services.cost_basis import compute_cost_basis, rebuild_realized_pnl, record_realized_pnl_for_trade
 from glassbox.services.position_history import (
     get_position_at_date,
     reconstruct_daily_positions,
     reconstruct_daily_positions_for_ticker,
 )
-from glassbox.services.trading import execute_trade as execute_trade_service
+from glassbox.services.theses import close_thesis
+
 
 router = APIRouter(tags=["trades"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/portfolio/cost-basis", response_model=list[CostBasisResponse])
@@ -234,29 +239,74 @@ def execute_trade(
     background_tasks: BackgroundTasks,
     db: DbSession,
 ) -> TradeResponse:
-    """Submit an Alpaca order, write the trade ledger row, and sync thesis history for buys."""
+    """Submit an Alpaca order and persist the local trade record."""
     try:
-        result = execute_trade_service(db, get_alpaca_client(), payload)
-    except SQLAlchemyError as exc:
-        raise database_error(exc) from exc
+        order = get_alpaca_client().submit_order(
+            symbol=payload.ticker,
+            side=payload.side,
+            qty=payload.qty,
+            order_type=payload.order_type,
+            time_in_force=payload.time_in_force,
+        )
     except Exception as exc:
         raise alpaca_error(exc) from exc
 
-    response = TradeResponse(
-        order_id=result.order.get("id", ""),
-        client_order_id=result.order.get("client_order_id", ""),
-        status=result.order.get("status", ""),
-        symbol=result.order.get("symbol", payload.ticker.upper()),
-        side=result.order.get("side", payload.side),
-        qty=result.order.get("qty", payload.qty),
-        filled_qty=result.order.get("filled_qty", 0.0),
-        filled_avg_price=result.order.get("filled_avg_price", 0.0),
-        submitted_at=result.order.get("submitted_at"),
-        local_trade_id=result.local_trade_id,
+    local_trade_id = order.get("id") or f"glassbox-{uuid4()}"
+    trade = Trade(
+        trade_id=local_trade_id,
+        ticker=payload.ticker.upper(),
+        action=TradeAction.BUY if payload.side == "buy" else TradeAction.SELL,
+        qty=payload.qty,
+        price=order.get("filled_avg_price") or None,
         strategy_tag=payload.strategy_tag,
-        thesis_recorded=result.thesis_recorded,
-        thesis_action=result.thesis_action,
+        investment_thesis=payload.thesis,
+    )
+
+    try:
+        db.add(trade)
+        if db.get(Ticker, payload.ticker.upper()) is None:
+            db.add(Ticker(symbol=payload.ticker.upper()))
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise database_error(exc) from exc
+
+    if trade.action == TradeAction.SELL:
+        try:
+            record_realized_pnl_for_trade(db, trade)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to persist realized P&L rows for sell trade %s", trade.trade_id)
+
+        try:
+            positions = get_alpaca_client().list_positions()
+            open_symbols = {str(position["symbol"]).upper() for position in positions}
+            if payload.ticker.upper() not in open_symbols:
+                close_thesis(db, payload.ticker.upper())
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to auto-close thesis for %s after sell trade %s",
+                payload.ticker.upper(),
+                trade.trade_id,
+            )
+
+    response = TradeResponse(
+        order_id=order.get("id", ""),
+        client_order_id=order.get("client_order_id", ""),
+        status=order.get("status", ""),
+        symbol=order.get("symbol", payload.ticker.upper()),
+        side=order.get("side", payload.side),
+        qty=order.get("qty", payload.qty),
+        filled_qty=order.get("filled_qty", 0.0),
+        filled_avg_price=order.get("filled_avg_price", 0.0),
+        submitted_at=order.get("submitted_at"),
+        local_trade_id=local_trade_id,
+        strategy_tag=payload.strategy_tag,
+        thesis_recorded=True,
     )
     background_tasks.add_task(backfill_symbol_prices_in_background, payload.ticker.upper())
     background_tasks.add_task(refresh_symbol_fundamentals_in_background, payload.ticker.upper())
     return response
+

@@ -111,7 +111,7 @@ async def execute_trade(
     order_type: str = "market",
     time_in_force: str = "day",
 ) -> dict | list:
-    """Submits an Alpaca order, always records the trade thesis on the ledger, syncs thesis history on buys, and closes the current thesis on full exits."""
+    """Submits an Alpaca order and logs trade metadata locally. Requires a ticker, side, quantity, and investment thesis."""
     return await _glassbox_request(
         "POST",
         "/trade/execute",

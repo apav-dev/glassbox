@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal, TypeAlias
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
 SymbolPattern = r"^[A-Z][A-Z0-9.\-]{0,15}$"
-ThesisAction: TypeAlias = Literal["created", "versioned", "unchanged", "closed", "not_written"]
 
 
 class TradeRequest(BaseModel):
@@ -34,7 +33,6 @@ class TradeResponse(BaseModel):
     local_trade_id: str
     strategy_tag: str | None
     thesis_recorded: bool
-    thesis_action: ThesisAction
 
 
 class PortfolioSummaryResponse(BaseModel):
