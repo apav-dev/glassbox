@@ -166,6 +166,20 @@ class AlpacaClient:
             "submitted_at": getattr(order, "submitted_at", None),
         }
 
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        order = self.trading_client.get_order_by_id(order_id)
+        return {
+            "id": str(order.id),
+            "client_order_id": order.client_order_id,
+            "status": order.status.value,
+            "symbol": order.symbol,
+            "side": order.side.value if order.side is not None else None,
+            "qty": self._to_float(order.qty),
+            "filled_qty": self._to_float(getattr(order, "filled_qty", 0)),
+            "filled_avg_price": self._to_float(getattr(order, "filled_avg_price", 0)),
+            "submitted_at": getattr(order, "submitted_at", None),
+        }
+
     def get_portfolio_history(
         self,
         *,

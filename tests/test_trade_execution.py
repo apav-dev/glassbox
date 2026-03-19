@@ -49,6 +49,12 @@ class FakeAlpacaClient:
     def list_positions(self) -> list[dict[str, Any]]:
         return self.positions
 
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        return {
+            "id": order_id,
+            "filled_avg_price": 101.25,
+        }
+
 
 @pytest.fixture
 def db_session() -> Iterator[Session]:

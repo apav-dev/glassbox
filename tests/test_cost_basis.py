@@ -212,6 +212,49 @@ def test_record_realized_pnl_for_trade_is_incremental(db_session: Session) -> No
     assert [float(row.pnl) for row in persisted_rows] == pytest.approx([80.0, 120.0])
 
 
+def test_rebuild_realized_pnl_refreshes_missing_trade_prices(db_session: Session) -> None:
+    db_session.add_all(
+        [
+            make_trade("buy-1", TradeAction.BUY, 10, None, minute=1),
+            make_trade("sell-1", TradeAction.SELL, 10, None, minute=2),
+        ]
+    )
+    db_session.commit()
+
+    fill_prices = {"buy-1": 10.0, "sell-1": 12.0}
+    rows_rebuilt = rebuild_realized_pnl(db_session, price_resolver=lambda trade_id: fill_prices.get(trade_id))
+    rows = db_session.scalars(select(RealizedPnl).order_by(RealizedPnl.id.asc())).all()
+    trades = db_session.scalars(select(Trade).order_by(Trade.trade_id.asc())).all()
+
+    assert rows_rebuilt == 1
+    assert len(rows) == 1
+    assert float(rows[0].pnl) == pytest.approx(20.0)
+    assert [float(trade.price or 0) for trade in trades] == pytest.approx([10.0, 12.0])
+
+
+def test_record_realized_pnl_for_trade_refreshes_missing_trade_prices(db_session: Session) -> None:
+    buy = make_trade("buy-1", TradeAction.BUY, 10, None, minute=1)
+    sell = make_trade("sell-1", TradeAction.SELL, 10, None, minute=2)
+    db_session.add_all([buy, sell])
+    db_session.commit()
+
+    fill_prices = {"buy-1": 10.0, "sell-1": 13.0}
+    rows = record_realized_pnl_for_trade(
+        db_session,
+        sell,
+        price_resolver=lambda trade_id: fill_prices.get(trade_id),
+    )
+    db_session.commit()
+
+    persisted_rows = db_session.scalars(select(RealizedPnl).order_by(RealizedPnl.id.asc())).all()
+    refreshed_trades = db_session.scalars(select(Trade).order_by(Trade.trade_id.asc())).all()
+
+    assert len(rows) == 1
+    assert len(persisted_rows) == 1
+    assert float(persisted_rows[0].pnl) == pytest.approx(30.0)
+    assert [float(trade.price or 0) for trade in refreshed_trades] == pytest.approx([10.0, 13.0])
+
+
 def test_compute_cost_basis_includes_commission_in_lot_prices() -> None:
     trades = [
         make_stub("buy-1", TradeAction.BUY, 10, 10.0, minute=1, commission=5.0),

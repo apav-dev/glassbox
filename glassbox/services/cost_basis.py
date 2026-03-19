@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -14,6 +16,7 @@ from glassbox.db.models import RealizedPnl, Trade, TradeAction
 
 logger = logging.getLogger(__name__)
 ZERO = Decimal("0")
+PriceResolver = Callable[[str], float | None]
 
 
 @dataclass
@@ -157,7 +160,33 @@ def _match_sell_to_lots(
     return rows, realized_total
 
 
-def rebuild_realized_pnl(db: Session) -> int:
+def _refresh_trade_price_if_missing(
+    db: Session,
+    trade: Trade,
+    price_resolver: PriceResolver | None,
+) -> bool:
+    if price_resolver is None or trade.price is not None:
+        return False
+
+    try:
+        resolved_price = price_resolver(trade.trade_id)
+    except Exception:
+        logger.exception("Failed to resolve fill price for trade %s", trade.trade_id)
+        return False
+
+    if resolved_price is None:
+        return False
+
+    resolved_price_value = float(resolved_price)
+    if resolved_price_value <= 0:
+        return False
+
+    trade.price = resolved_price_value
+    db.add(trade)
+    return True
+
+
+def rebuild_realized_pnl(db: Session, price_resolver: PriceResolver | None = None) -> int:
     trades = db.scalars(select(Trade).order_by(Trade.timestamp.asc(), Trade.trade_id.asc())).all()
     grouped_lots: dict[str, deque[_Lot]] = defaultdict(deque)
     rows_to_insert: list[RealizedPnl] = []
@@ -165,6 +194,7 @@ def rebuild_realized_pnl(db: Session) -> int:
     db.execute(delete(RealizedPnl))
 
     for trade in trades:
+        _refresh_trade_price_if_missing(db, trade, price_resolver)
         symbol = trade.ticker.upper()
         quantity = _to_decimal(trade.qty)
         effective_price = _effective_price(trade.price, trade.commission, trade.qty, trade.action)
@@ -192,7 +222,11 @@ def rebuild_realized_pnl(db: Session) -> int:
     return len(rows_to_insert)
 
 
-def record_realized_pnl_for_trade(db: Session, sell_trade: Trade) -> list[RealizedPnl]:
+def record_realized_pnl_for_trade(
+    db: Session,
+    sell_trade: Trade,
+    price_resolver: PriceResolver | None = None,
+) -> list[RealizedPnl]:
     if sell_trade.action != TradeAction.SELL:
         return []
 
@@ -206,10 +240,12 @@ def record_realized_pnl_for_trade(db: Session, sell_trade: Trade) -> list[Realiz
     lots: deque[_Lot] = deque()
     inserted_rows: list[RealizedPnl] = []
     sell_found = False
+    prices_refreshed = False
 
     db.execute(delete(RealizedPnl).where(RealizedPnl.sell_trade_id == sell_trade.trade_id))
 
     for trade in trades:
+        prices_refreshed = _refresh_trade_price_if_missing(db, trade, price_resolver) or prices_refreshed
         quantity = _to_decimal(trade.qty)
         effective_price = _effective_price(trade.price, trade.commission, trade.qty, trade.action)
         if effective_price is None or quantity <= ZERO:
@@ -244,6 +280,8 @@ def record_realized_pnl_for_trade(db: Session, sell_trade: Trade) -> list[Realiz
 
     if inserted_rows:
         db.add_all(inserted_rows)
+        db.flush()
+    elif prices_refreshed:
         db.flush()
 
     return inserted_rows

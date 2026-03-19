@@ -65,7 +65,7 @@ def execute_trade(db: Session, alpaca_client: Any, payload: TradeRequest) -> Tra
         raise
 
     if trade.action == TradeAction.SELL:
-        _persist_sell_side_effects(db, trade)
+        _persist_sell_side_effects(db, trade, alpaca_client)
         if _close_thesis_if_position_exited(db, alpaca_client, symbol, trade.trade_id):
             thesis_action = "closed"
 
@@ -76,9 +76,21 @@ def execute_trade(db: Session, alpaca_client: Any, payload: TradeRequest) -> Tra
     )
 
 
-def _persist_sell_side_effects(db: Session, trade: Trade) -> None:
+def _resolve_trade_fill_price(alpaca_client: Any, trade_id: str) -> float | None:
+    order = alpaca_client.get_order(trade_id)
+    filled_avg_price = order.get("filled_avg_price")
+    if filled_avg_price in (None, 0, 0.0, ""):
+        return None
+    return float(filled_avg_price)
+
+
+def _persist_sell_side_effects(db: Session, trade: Trade, alpaca_client: Any) -> None:
     try:
-        record_realized_pnl_for_trade(db, trade)
+        record_realized_pnl_for_trade(
+            db,
+            trade,
+            price_resolver=lambda trade_id: _resolve_trade_fill_price(alpaca_client, trade_id),
+        )
         db.commit()
     except Exception:
         db.rollback()

@@ -118,7 +118,11 @@ def get_realized_pnl_details(
 def rebuild_realized_pnl_records(db: DbSession) -> dict[str, int]:
     """Rebuild the realized P&L table from the local trade log."""
     try:
-        rows_rebuilt = rebuild_realized_pnl(db)
+        alpaca_client = get_alpaca_client()
+        rows_rebuilt = rebuild_realized_pnl(
+            db,
+            price_resolver=lambda trade_id: alpaca_client.get_order(trade_id).get("filled_avg_price"),
+        )
     except SQLAlchemyError as exc:
         db.rollback()
         raise database_error(exc) from exc

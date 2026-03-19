@@ -660,8 +660,12 @@ def get_realized_pnl_details(
 def rebuild_realized_pnl() -> dict | list:
     """Rebuilds the realized P&L table from the local trade log. Use this after ledger changes when you need to recompute realized gains and losses."""
     def operation() -> dict:
+        alpaca_client = get_alpaca_client()
         with _db() as db:
-            rows_rebuilt = rebuild_realized_pnl_service(db)
+            rows_rebuilt = rebuild_realized_pnl_service(
+                db,
+                price_resolver=lambda trade_id: alpaca_client.get_order(trade_id).get("filled_avg_price"),
+            )
         return {"rows_rebuilt": rows_rebuilt}
 
     return _run(operation)

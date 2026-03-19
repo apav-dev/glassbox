@@ -1,2 +1,0 @@
-"""Glassbox trading backend package."""
-
