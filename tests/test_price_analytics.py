@@ -233,7 +233,7 @@ def test_backfill_ticker_prices_inserts_rows_and_only_fetches_gap(
     monkeypatch.setattr(price_service, "fetch_daily_prices", fake_fetch_daily_prices)
     monkeypatch.setattr(price_service, "datetime", FirstNow)
 
-    inserted = price_service.backfill_ticker_prices(db_session, "AAPL", lookback_days=30)
+    inserted = price_service.backfill_ticker_prices(db_session, "AAPL", lookback_days=2)
     rows = db_session.query(DailyPrice).filter(DailyPrice.symbol == "AAPL").order_by(DailyPrice.date.asc()).all()
 
     assert inserted == 3
@@ -241,7 +241,7 @@ def test_backfill_ticker_prices_inserts_rows_and_only_fetches_gap(
     assert fetch_calls[0] == ("AAPL", first_start, first_end)
 
     monkeypatch.setattr(price_service, "datetime", SecondNow)
-    inserted = price_service.backfill_ticker_prices(db_session, "AAPL", lookback_days=30)
+    inserted = price_service.backfill_ticker_prices(db_session, "AAPL", lookback_days=2)
     rows = db_session.query(DailyPrice).filter(DailyPrice.symbol == "AAPL").order_by(DailyPrice.date.asc()).all()
 
     assert inserted == 2
